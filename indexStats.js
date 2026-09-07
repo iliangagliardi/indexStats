@@ -509,7 +509,94 @@
     print(`|${line}`);
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues };
+  const VERDICT_ORDER = ['drop', 'likely-drop', 'review', 'inconclusive', 'mismatched', 'keep'];
+
+  function deriveVerdict(idx, ctx) {
+    const flags = [];
+    const reasons = [];
+    if (idx.redundancy.class) flags.push(`redundant:${idx.redundancy.class}`);
+    if (idx.hidden) flags.push('hidden');
+
+    const suspect = (idx.schema?.checks ?? []).filter(
+      (c) => c.issue === 'absent' || (c.issue === 'not-in-validator' && c.provable));
+    if (suspect.length) {
+      flags.push('suspect-field');
+      reasons.push(`key field '${suspect[0].field}' ${suspect[0].text ?? 'does not match the documents'}`);
+    }
+
+    if (!idx.definition.consistent) {
+      flags.push('mismatched');
+      reasons.unshift(idx.definition.missingOn.length
+        ? `definition missing on ${idx.definition.missingOn.join(', ')} - possible in-flight or stalled rolling index build`
+        : 'key pattern differs between members - possible in-flight or stalled rolling index build');
+      return { verdict: 'mismatched', flags, reasons };
+    }
+
+    if (idx.name === '_id_') {
+      reasons.unshift('the _id_ index cannot be dropped');
+      return { verdict: 'keep', flags, reasons };
+    }
+
+    if (idx.maxOps > 0) {
+      const usedHosts = idx.perNode.filter((n) => n.present && n.ops > 0).map((n) => n.host);
+      if (usedHosts.length && usedHosts.every((h) => ctx.hiddenHosts.includes(h))) {
+        flags.push('used-only-on-hidden');
+        reasons.unshift(`all ${idx.maxOps} observed operations came from hidden or delayed members (${usedHosts.join(', ')})`);
+      } else {
+        reasons.unshift(`${idx.maxOps} operations on ${usedHosts.join(', ')}`);
+      }
+      if (idx.redundancy.class) {
+        reasons.push(`covered by '${idx.redundancy.coveredBy}', which can serve these reads`);
+        return { verdict: 'review', flags, reasons };
+      }
+      return { verdict: 'keep', flags, reasons };
+    }
+
+    if (ctx.unreachableHosts.length) {
+      reasons.unshift(`zero operations everywhere observed, but ${ctx.unreachableHosts.join(', ')} could not be reached - unused cannot be confirmed`);
+      return { verdict: 'inconclusive', flags, reasons };
+    }
+    if (idx.minCounterAgeDays === null
+        || idx.minCounterAgeDays < ctx.config.DROP_MIN_COUNTER_DAYS) {
+      const age = idx.minCounterAgeDays === null ? 'unknown'
+        : idx.minCounterAgeDays.toFixed(1);
+      reasons.unshift(`zero operations, but the youngest counter is ${age} days old, under the ${ctx.config.DROP_MIN_COUNTER_DAYS}-day threshold - counters reset on mongod restart`);
+      return { verdict: 'inconclusive', flags, reasons };
+    }
+
+    reasons.unshift(`zero operations on every data-bearing member for at least ${Math.floor(idx.minCounterAgeDays)} days`);
+    if (idx.redundancy.class || suspect.length) {
+      if (idx.redundancy.class) reasons.push(`covered by '${idx.redundancy.coveredBy}'`);
+      return { verdict: 'drop', flags, reasons };
+    }
+    return { verdict: 'likely-drop', flags, reasons };
+  }
+
+  function applyAnalysis(payload, config, samples) {
+    const hiddenHosts = payload.members.filter((m) => m.hidden).map((m) => m.host);
+    const unreachableHosts = payload.gaps.unreachableMembers.map((m) => m.host);
+    const sampleByNs = new Map((samples ?? []).map((s) => [s.ns, s]));
+
+    for (const idx of payload.indexes) {
+      const sample = sampleByNs.get(idx.ns);
+      idx.schema = {
+        checks: sample && !sample.error
+          ? classifySchemaIssues({ name: idx.name, key: idx.key, ...idx.options },
+              { size: sample.size, paths: sample.paths,
+                validator: sample.validator }, config)
+          : [],
+      };
+      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts }));
+    }
+
+    payload.indexes.sort((a, b) => {
+      const d = VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict);
+      return d !== 0 ? d : b.clusterSizeBytes - a.clusterSizeBytes;
+    });
+    return payload;
+  }
+
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
