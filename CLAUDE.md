@@ -36,6 +36,13 @@ Everything lives in one IIFE in `indexStats.js`:
 
 - **Pure mongosh, no imports.** Only `db`, `print`, and standard JS.
 - **Every server call carries `maxTimeMS`** so one stalled node cannot hang the run.
+  Documented exception: mongosh's `getCollectionInfos`/`getIndexes` helpers accept no
+  `maxTimeMS`. The raw `listCollections`/`listIndexes` commands do, but they return a
+  cursor document, and reading only `cursor.firstBatch` would silently truncate a
+  database with many collections or a collection with many indexes - missing
+  collections mean missing indexes and wrong "unused" verdicts, worse than a rare
+  stall on a metadata call. The per-database and per-collection try/catch bounds the
+  damage instead.
 - **Error isolation at both levels.** A throwing database or collection is caught,
   pushed to `summary.skipped` with `err.codeName ?? err.message`, and the run
   continues. Never let one namespace abort the report.

@@ -83,6 +83,21 @@ test('falls back to single-node mode when replication is not enabled', () => {
   assert.deepEqual(members.map((m) => m.host), ['h9:27017']);
 });
 
+test('an Unauthorized error from replSetGetConfig throws, not a silent single-node fallback', () => {
+  const adminDb = {
+    runCommand(cmd) {
+      if (cmd.hello) return { ok: 1 };
+      if (cmd.replSetGetConfig) {
+        const e = new Error('not authorized on admin to execute command');
+        e.codeName = 'Unauthorized';
+        throw e;
+      }
+      throw new Error('unexpected command ' + JSON.stringify(cmd));
+    },
+  };
+  assert.throws(() => discoverMembers(adminDb, CONFIG), /not authorized/i);
+});
+
 function fakeConn() {
   const coll = () => ({
     aggregate(pipeline) {

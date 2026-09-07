@@ -64,7 +64,18 @@
     try {
       rsConfig = adminDb.runCommand({ replSetGetConfig: 1, maxTimeMS: config.MAX_TIME_MS }).config;
     } catch (e) {
-      rsConfig = null;
+      // Only these two codes genuinely mean "no replication is configured here" -
+      // fall back to single-node mode. Anything else (Unauthorized,
+      // AuthenticationFailed, a network blip, ...) must NOT be treated the same way:
+      // silently downgrading a real replica set to a one-node "standalone" report
+      // is exactly the failure this tool exists to prevent - a user could then drop
+      // an index that another member still relies on. Re-throw with the original
+      // message/codeName so the caller (main(), Task 9) surfaces it as fatal.
+      if (e.codeName === 'NoReplicationEnabled' || e.codeName === 'NotYetInitialized') {
+        rsConfig = null;
+      } else {
+        throw e;
+      }
     }
     if (!rsConfig) {
       return {
@@ -100,8 +111,16 @@
     for (const dbName of dbNames) {
       let collNames = [];
       try {
+        // mongosh's getCollectionInfos helper exposes no maxTimeMS (its signature is
+        // (filter, nameOnly, authorizedCollections, options) - nameOnly is a boolean,
+        // not an options bag). Using the raw listCollections command instead would let
+        // us pass maxTimeMS, but that command returns a cursor document, and reading
+        // only cursor.firstBatch would silently truncate on a database with more
+        // collections than fit in one batch - missing collections here mean missing
+        // indexes and wrong "unused" verdicts, which is worse than a rare stall on a
+        // metadata call. The per-database try/catch below is what bounds that risk.
         collNames = conn.getDB(dbName)
-          .getCollectionInfos({ type: 'collection' }, { nameOnly: true })
+          .getCollectionInfos({ type: 'collection' }, true)
           .map((c) => c.name).filter((n) => !n.startsWith('system.')).sort();
       } catch (e) {
         result.skipped.push({ ns: dbName, reason: e.codeName ?? e.message });
@@ -136,6 +155,10 @@
             e.ops += Number(st.accesses.ops);
             if (st.accesses.since < e.since) e.since = st.accesses.since;
           }
+          // Same trade-off as getCollectionInfos above: mongosh's getIndexes helper
+          // takes no maxTimeMS, and the raw listIndexes command's cursor.firstBatch
+          // would silently truncate a collection with many indexes. The per-collection
+          // try/catch below is what bounds the damage of a stall here, not maxTimeMS.
           entry.indexes = coll.getIndexes();
         } catch (e) {
           entry.error = e.codeName ?? e.message;
