@@ -227,7 +227,13 @@
     module.exports = api;
   }
 
-  if (typeof db !== 'undefined' && typeof print === 'function') {
-    main();
+  try {
+    if (typeof db !== 'undefined' && typeof print === 'function') {
+      main();
+    }
+  } catch (e) {
+    if (typeof print === 'function') {
+      print('| Connect to a database first: mongosh "mongodb://..." --file indexStats.js');
+    }
   }
 })();
