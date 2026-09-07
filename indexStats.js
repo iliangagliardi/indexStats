@@ -596,7 +596,147 @@
     return payload;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis };
+  function esc(v) {
+    return String(v).replace(/[&<>"]/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  function jsonForScript(obj) {
+    return JSON.stringify(obj).replace(/</g, '\\u003c');
+  }
+
+  function fmtBytes(bytes) {
+    var b = Number(bytes || 0);
+    if (b < 1024) return b.toFixed(0) + ' b';
+    var units = ['kb', 'mb', 'gb', 'tb'];
+    var i = -1;
+    do { b = b / 1024; i++; } while (b >= 1024 && i < units.length - 1);
+    return b.toFixed(1) + ' ' + units[i];
+  }
+
+  const REPORT_CSS = `
+:root{--bg:#fff;--card:#f7f7f5;--fg:#1a1a19;--muted:#6b6b68;--line:#e3e3e0;
+--danger:#b3261e;--dangerbg:#fdecea;--warn:#8a5300;--warnbg:#fdf3e3;
+--accent:#1a56a8;--accentbg:#eaf1fb;--ok:#1e6b3a}
+@media(prefers-color-scheme:dark){:root{--bg:#191918;--card:#232322;--fg:#ececeb;
+--muted:#a1a19d;--line:#33332f;--danger:#f2857c;--dangerbg:#3a1f1c;--warn:#e0ac5c;
+--warnbg:#332715;--accent:#8fb6f0;--accentbg:#1b2740;--ok:#7fc79b}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+h1{font-size:20px;font-weight:500;margin:0}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.muted{color:var(--muted)}
+.wrap{max-width:1200px;margin:0 auto}
+.head{display:flex;justify-content:space-between;align-items:baseline;
+border-bottom:1px solid var(--line);padding-bottom:12px}
+.banner{margin-top:12px;padding:10px 12px;border-radius:8px;
+background:var(--warnbg);color:var(--warn);border:1px solid var(--warn)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:16px}
+.card{background:var(--card);border-radius:8px;padding:12px 14px}
+.card .k{font-size:12px;color:var(--muted)}
+.card .v{font-size:24px;font-weight:500;margin-top:2px}
+.members{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:12px}
+.member{background:var(--card);border-left:3px solid var(--muted);padding:8px 10px;font-size:13px}
+.member.pri{border-left-color:var(--ok)}
+.member.sec{border-left-color:var(--accent)}
+.member.hid{border-left-color:var(--warn)}
+.member.down{border-left-color:var(--danger);color:var(--danger)}
+.controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:20px}
+.chip{font-size:13px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;
+background:none;color:var(--muted);cursor:pointer}
+.chip.on{border-color:var(--fg);color:var(--fg)}
+.chip.drop.on{border-color:var(--danger);color:var(--danger);background:var(--dangerbg)}
+input[type=search]{padding:6px 10px;border:1px solid var(--line);border-radius:8px;
+background:var(--bg);color:var(--fg);min-width:220px}
+button.act{padding:6px 10px;border:1px solid var(--line);border-radius:8px;
+background:var(--bg);color:var(--fg);cursor:pointer}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
+th{text-align:left;font-weight:400;color:var(--muted);border-bottom:1px solid var(--line);
+padding:6px 4px;cursor:pointer;white-space:nowrap}
+td{padding:8px 4px;border-bottom:1px solid var(--line);vertical-align:top}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.idx{cursor:pointer}
+tr.idx:hover td{background:var(--card)}
+.tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px}
+.tag.drop,.tag.likely-drop{background:var(--dangerbg);color:var(--danger)}
+.tag.inconclusive,.tag.review{background:var(--warnbg);color:var(--warn)}
+.tag.mismatched{background:var(--card);color:var(--fg)}
+.tag.keep{background:var(--accentbg);color:var(--accent)}
+.detail{background:var(--card)}
+.detail table{margin:0}
+.detail td,.detail th{border-bottom:none;padding:3px 4px}
+details{margin-top:24px}
+summary{cursor:pointer;color:var(--muted)}
+pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-size:12px}
+`;
+
+  function renderMembers(members) {
+    return members.map((m) => {
+      const cls = !m.reachable ? 'down' : m.hidden ? 'hid'
+        : m.role === 'primary' ? 'pri' : 'sec';
+      const bits = [esc(m.role)];
+      if (m.hidden) bits.push('hidden');
+      if (m.delaySecs) bits.push(`delayed ${m.delaySecs}s`);
+      const label = !m.reachable
+        ? `unreachable - ${esc(m.error ?? 'unknown error')}${m.hidden ? ' / hidden' : ''}${m.delaySecs ? ` / delayed ${m.delaySecs}s` : ''}`
+        : bits.join(' / ');
+      return `<div class="member ${cls}"><div class="mono">${esc(m.host)}</div>`
+        + `<div class="muted">${label}</div></div>`;
+    }).join('');
+  }
+
+  function renderGapBanner(payload) {
+    const down = payload.gaps.unreachableMembers;
+    if (down.length === 0) return '';
+    const hosts = down.map((d) => esc(d.host)).join(', ');
+    return `<div class="banner" id="gap-banner">${down.length} member`
+      + `${down.length > 1 ? 's' : ''} unreachable (${hosts}) - no index can be `
+      + 'confirmed unused, so zero-operation verdicts are downgraded to inconclusive</div>';
+  }
+
+  function renderGapsPanel(payload) {
+    const total = payload.gaps.skipped.length + payload.gaps.unreachableMembers.length;
+    if (total === 0) return '';
+    const rows = [
+      ...payload.gaps.unreachableMembers.map((m) =>
+        `<tr><td class="mono">${esc(m.host)}</td><td>member unreachable</td>`
+        + `<td>${esc(m.error ?? '')}</td></tr>`),
+      ...payload.gaps.skipped.map((s) =>
+        `<tr><td class="mono">${esc(s.member)}</td><td class="mono">${esc(s.ns)}</td>`
+        + `<td>${esc(s.reason)}</td></tr>`),
+    ].join('');
+    return `<details><summary>gaps in this report (${total})</summary>`
+      + '<table><thead><tr><th>member</th><th>namespace</th><th>reason</th></tr></thead>'
+      + `<tbody>${rows}</tbody></table></details>`;
+  }
+
+  function renderHTML(payload) {
+    const dbCount = new Set(payload.namespaces.map((n) => n.db)).size;
+    return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>index report - ${esc(payload.meta.replicaSetName)}</title>
+<style>${REPORT_CSS}</style></head>
+<body><div class="wrap">
+<div class="head">
+<div><h1>${esc(payload.meta.replicaSetName)}</h1>
+<div class="muted mono">${payload.members.length} members / ${dbCount} databases / ${payload.namespaces.length} collections / ${payload.indexes.length} indexes</div></div>
+<div class="muted">${esc(payload.meta.generatedAt)}</div>
+</div>
+${renderGapBanner(payload)}
+<div class="cards" id="cards"></div>
+<div class="members">${renderMembers(payload.members)}</div>
+<div class="controls" id="controls"></div>
+<div id="table-host"></div>
+${renderGapsPanel(payload)}
+<details><summary>raw payload (json)</summary><pre id="raw"></pre></details>
+</div>
+<script type="application/json" id="indexstats-data">${jsonForScript(payload)}</script>
+</body></html>`;
+  }
+
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
