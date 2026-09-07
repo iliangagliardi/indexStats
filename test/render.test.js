@@ -111,4 +111,89 @@ test('lists skipped namespaces with their reason', () => {
   assert.match(html, /MaxTimeMSExpired/);
 });
 
+const { selectIndexes, summarise, dropCommandsFor } = require('../indexStats.js');
+
+function ix(over) {
+  return { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
+           clusterSizeBytes: 100, minCounterAgeDays: 30, ...over };
+}
+
+test('selectIndexes filters by verdict', () => {
+  const all = [ix({ name: 'x', verdict: 'drop' }), ix({ name: 'y', verdict: 'keep' })];
+  const out = selectIndexes(all, { filter: 'drop', search: '', sortKey: 'size', sortDir: -1 });
+  assert.deepEqual(out.map((i) => i.name), ['x']);
+});
+
+test('selectIndexes filters by flag prefix', () => {
+  const all = [ix({ name: 'x', flags: ['redundant:prefix'] }), ix({ name: 'y', flags: [] })];
+  const out = selectIndexes(all, { filter: 'redundant', search: '', sortKey: 'size', sortDir: -1 });
+  assert.deepEqual(out.map((i) => i.name), ['x']);
+});
+
+test('selectIndexes searches namespace and index name, case-insensitively', () => {
+  const all = [ix({ ns: 'crm.contacts', name: 'email_1' }), ix({ ns: 'shop.orders', name: 'a_1' })];
+  const base = { filter: 'all', sortKey: 'size', sortDir: -1 };
+  assert.deepEqual(selectIndexes(all, { ...base, search: 'CRM' }).map((i) => i.ns), ['crm.contacts']);
+  assert.deepEqual(selectIndexes(all, { ...base, search: 'email' }).map((i) => i.name), ['email_1']);
+});
+
+test('selectIndexes sorts by the requested key and direction', () => {
+  const all = [ix({ name: 'small', clusterSizeBytes: 1 }), ix({ name: 'big', clusterSizeBytes: 900 })];
+  const state = { filter: 'all', search: '', sortKey: 'size', sortDir: -1 };
+  assert.deepEqual(selectIndexes(all, state).map((i) => i.name), ['big', 'small']);
+  assert.deepEqual(selectIndexes(all, { ...state, sortDir: 1 }).map((i) => i.name), ['small', 'big']);
+});
+
+test('selectIndexes does not mutate its input', () => {
+  const all = [ix({ name: 'a', clusterSizeBytes: 1 }), ix({ name: 'b', clusterSizeBytes: 9 })];
+  selectIndexes(all, { filter: 'all', search: '', sortKey: 'size', sortDir: -1 });
+  assert.deepEqual(all.map((i) => i.name), ['a', 'b']);
+});
+
+test('summarise counts only what is passed to it', () => {
+  const s = summarise([
+    ix({ verdict: 'drop', clusterSizeBytes: 100 }),
+    ix({ verdict: 'likely-drop', clusterSizeBytes: 50 }),
+    ix({ verdict: 'inconclusive', clusterSizeBytes: 10 }),
+    ix({ verdict: 'keep', flags: ['redundant:prefix'] }),
+  ]);
+  assert.equal(s.drop, 2);
+  assert.equal(s.reclaimable, 150);
+  assert.equal(s.inconclusive, 1);
+  assert.equal(s.redundant, 1);
+});
+
+test('dropCommandsFor emits one runnable statement per namespace', () => {
+  const cmds = dropCommandsFor([
+    ix({ ns: 'shop.orders', name: 'a_1', verdict: 'drop' }),
+    ix({ ns: 'shop.orders', name: 'b_1', verdict: 'drop' }),
+    ix({ ns: 'crm.contacts', name: 'c_1', verdict: 'likely-drop' }),
+  ]);
+  assert.match(cmds, /getSiblingDB\("shop"\)\.getCollection\("orders"\)\.dropIndexes\(\["a_1","b_1"\]\)/);
+  assert.match(cmds, /getSiblingDB\("crm"\)\.getCollection\("contacts"\)\.dropIndexes\(\["c_1"\]\)/);
+});
+
+test('dropCommandsFor never emits commands for non-candidates', () => {
+  const cmds = dropCommandsFor([ix({ verdict: 'keep' }), ix({ verdict: 'inconclusive' }),
+                                ix({ verdict: 'mismatched' }), ix({ verdict: 'review' })]);
+  assert.equal(cmds.trim(), '');
+});
+
+test('the report embeds the client functions and boots them', () => {
+  const html = renderHTML(payload());
+  assert.match(html, /function selectIndexes/);
+  assert.match(html, /function summarise/);
+  assert.match(html, /function dropCommandsFor/);
+  assert.match(html, /function fmtBytes/);
+  assert.match(html, /id="table-host"/);
+});
+
+test('client functions close over nothing from the enclosing scope', () => {
+  for (const fn of [selectIndexes, summarise, dropCommandsFor, fmtBytes]) {
+    const src = fn.toString();
+    assert.equal(/\bLOW_PRESENCE\b|\bVERDICT_ORDER\b|\bREPORT_CSS\b|\bapi\b/.test(src), false,
+      `${fn.name} must not reference enclosing scope`);
+  }
+});
+
 module.exports = { payload };

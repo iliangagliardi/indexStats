@@ -614,6 +614,156 @@
     return b.toFixed(1) + ' ' + units[i];
   }
 
+  function selectIndexes(indexes, state) {
+    var q = (state.search || '').toLowerCase();
+    var rows = indexes.filter(function (i) {
+      var byFilter = state.filter === 'all'
+        || i.verdict === state.filter
+        || (i.flags || []).some(function (f) {
+             return f === state.filter || f.indexOf(state.filter + ':') === 0;
+           });
+      var bySearch = !q
+        || i.ns.toLowerCase().indexOf(q) !== -1
+        || i.name.toLowerCase().indexOf(q) !== -1;
+      return byFilter && bySearch;
+    });
+    var key = state.sortKey;
+    var dir = state.sortDir;
+    return rows.slice().sort(function (a, b) {
+      var av, bv;
+      if (key === 'ops') { av = a.maxOps; bv = b.maxOps; }
+      else if (key === 'age') { av = a.minCounterAgeDays || 0; bv = b.minCounterAgeDays || 0; }
+      else if (key === 'ns') { return dir * (a.ns + a.name).localeCompare(b.ns + b.name); }
+      else { av = a.clusterSizeBytes; bv = b.clusterSizeBytes; }
+      return dir * (av - bv);
+    });
+  }
+
+  function summarise(indexes) {
+    var out = { reclaimable: 0, drop: 0, inconclusive: 0, redundant: 0 };
+    indexes.forEach(function (i) {
+      if (i.verdict === 'drop' || i.verdict === 'likely-drop') {
+        out.drop++;
+        out.reclaimable += i.clusterSizeBytes;
+      }
+      if (i.verdict === 'inconclusive') out.inconclusive++;
+      if ((i.flags || []).some(function (f) { return f.indexOf('redundant') === 0; })) out.redundant++;
+    });
+    return out;
+  }
+
+  function dropCommandsFor(indexes) {
+    var byNs = {};
+    indexes.forEach(function (i) {
+      if (i.verdict !== 'drop' && i.verdict !== 'likely-drop') return;
+      (byNs[i.ns] = byNs[i.ns] || []).push(i.name);
+    });
+    return Object.keys(byNs).sort().map(function (ns) {
+      var dbName = ns.split('.')[0];
+      var collName = ns.split('.').slice(1).join('.');
+      var names = byNs[ns].map(function (n) { return '"' + n + '"'; }).join(',');
+      return 'db.getSiblingDB("' + dbName + '").getCollection("' + collName
+        + '").dropIndexes([' + names + '])';
+    }).join('\n');
+  }
+
+  const CLIENT_FUNCTIONS = [fmtBytes, selectIndexes, summarise, dropCommandsFor]
+    .map((f) => f.toString()).join('\n');
+
+  const CLIENT_BOOTSTRAP = `
+var DATA = JSON.parse(document.getElementById('indexstats-data').textContent);
+var STATE = { filter: 'all', search: '', sortKey: 'size', sortDir: -1 };
+var FILTERS = ['all','drop','likely-drop','inconclusive','review','mismatched','keep',
+               'redundant','suspect-field','used-only-on-hidden'];
+function h(s){return String(s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function countFor(f){return f==='all'?DATA.indexes.length:
+  selectIndexes(DATA.indexes,{filter:f,search:'',sortKey:'size',sortDir:-1}).length;}
+function renderControls(){
+  var html = FILTERS.filter(function(f){return f==='all'||countFor(f)>0;}).map(function(f){
+    return '<button class="chip '+f+(STATE.filter===f?' on':'')+'" data-f="'+f+'">'+f+' '+countFor(f)+'</button>';
+  }).join('');
+  html += '<input type="search" id="q" placeholder="filter by namespace or index name" value="'+h(STATE.search)+'">';
+  html += '<button class="act" id="copy">copy dropIndexes commands</button>';
+  var el = document.getElementById('controls');
+  el.innerHTML = html;
+  el.querySelectorAll('.chip').forEach(function(b){
+    b.onclick = function(){ STATE.filter = b.dataset.f; draw(); };
+  });
+  var q = document.getElementById('q');
+  q.oninput = function(){ STATE.search = q.value; drawTable(); drawCards(); };
+  document.getElementById('copy').onclick = function(){
+    var cmds = dropCommandsFor(selectIndexes(DATA.indexes, STATE));
+    var btn = document.getElementById('copy');
+    navigator.clipboard.writeText(cmds).then(function(){
+      btn.textContent = cmds ? 'copied' : 'nothing to copy';
+      setTimeout(renderControls, 1500);
+    }, function(){ btn.textContent = 'clipboard blocked - see raw payload'; });
+  };
+}
+function drawCards(){
+  var s = summarise(selectIndexes(DATA.indexes, STATE));
+  document.getElementById('cards').innerHTML =
+    '<div class="card"><div class="k">reclaimable, cluster</div><div class="v">'+fmtBytes(s.reclaimable)+'</div></div>'+
+    '<div class="card"><div class="k">drop candidates</div><div class="v">'+s.drop+'</div></div>'+
+    '<div class="card"><div class="k">inconclusive</div><div class="v">'+s.inconclusive+'</div></div>'+
+    '<div class="card"><div class="k">redundant</div><div class="v">'+s.redundant+'</div></div>';
+}
+function nodeRows(i){
+  return i.perNode.map(function(n){
+    if(!n.present) return '<tr><td class="mono">'+h(n.host)+'</td><td colspan="4" class="muted">index not present'+(n.error?' - '+h(n.error):'')+'</td></tr>';
+    return '<tr><td class="mono">'+h(n.host)+'</td><td class="num">'+n.ops+'</td><td class="num">'+
+      (n.counterAgeDays===null?'-':n.counterAgeDays.toFixed(1)+' d')+'</td><td class="num">'+
+      fmtBytes(n.sizeBytes)+'</td><td class="num">'+fmtBytes(n.reusableBytes)+'</td></tr>';
+  }).join('');
+}
+function detailFor(i){
+  var parts = '<div class="muted">'+h(JSON.stringify(i.key))+
+    (i.redundancy.coveredBy?' - covered by '+h(i.redundancy.coveredBy):'')+'</div>';
+  if(i.reasons && i.reasons.length) parts += '<ul class="muted">'+i.reasons.map(function(r){
+    return '<li>'+h(r)+'</li>';}).join('')+'</ul>';
+  if(i.schema && i.schema.checks.length) parts += '<ul class="muted">'+i.schema.checks.map(function(c){
+    return '<li>key field <span class="mono">'+h(c.field)+'</span>: '+h(c.text)+'</li>';}).join('')+'</ul>';
+  parts += '<table><thead><tr><th>member</th><th class="num">ops</th><th class="num">counter age</th>'+
+    '<th class="num">size</th><th class="num">reusable</th></tr></thead><tbody>'+nodeRows(i)+'</tbody></table>';
+  return parts;
+}
+function drawTable(){
+  var rows = selectIndexes(DATA.indexes, STATE);
+  var head = '<table><thead><tr><th data-s="ns">namespace and index</th><th>verdict</th>'+
+    '<th class="num" data-s="ops">ops, max</th><th class="num" data-s="age">counter age</th>'+
+    '<th class="num" data-s="size">cluster size</th></tr></thead><tbody>';
+  var body = rows.map(function(i,n){
+    return '<tr class="idx" data-n="'+n+'"><td><span class="mono">'+h(i.ns)+
+      '</span><div class="mono muted">'+h(i.name)+'</div></td>'+
+      '<td><span class="tag '+i.verdict+'">'+i.verdict+'</span>'+
+      (i.flags.length?'<div class="muted">'+h(i.flags.join(', '))+'</div>':'')+'</td>'+
+      '<td class="num">'+i.maxOps+'</td>'+
+      '<td class="num">'+(i.minCounterAgeDays===null?'-':i.minCounterAgeDays.toFixed(0)+' d')+'</td>'+
+      '<td class="num">'+fmtBytes(i.clusterSizeBytes)+'</td></tr>'+
+      '<tr class="detail" id="d'+n+'" hidden><td colspan="5">'+detailFor(i)+'</td></tr>';
+  }).join('');
+  document.getElementById('table-host').innerHTML = head + body + '</tbody></table>';
+  document.querySelectorAll('#table-host th[data-s]').forEach(function(th){
+    th.onclick = function(){
+      var k = th.dataset.s;
+      STATE.sortDir = STATE.sortKey === k ? -STATE.sortDir : -1;
+      STATE.sortKey = k;
+      drawTable();
+    };
+  });
+  document.querySelectorAll('tr.idx').forEach(function(tr){
+    tr.onclick = function(){
+      var d = document.getElementById('d' + tr.dataset.n);
+      d.hidden = !d.hidden;
+    };
+  });
+}
+function draw(){ renderControls(); drawCards(); drawTable(); }
+document.getElementById('raw').textContent = JSON.stringify(DATA, null, 2);
+draw();
+`;
+
   const REPORT_CSS = `
 :root{--bg:#fff;--card:#f7f7f5;--fg:#1a1a19;--muted:#6b6b68;--line:#e3e3e0;
 --danger:#b3261e;--dangerbg:#fdecea;--warn:#8a5300;--warnbg:#fdf3e3;
@@ -733,10 +883,12 @@ ${renderGapsPanel(payload)}
 <details><summary>raw payload (json)</summary><pre id="raw"></pre></details>
 </div>
 <script type="application/json" id="indexstats-data">${jsonForScript(payload)}</script>
+<script>${CLIENT_FUNCTIONS}
+${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

@@ -1,0 +1,153 @@
+{
+  "meta": {
+    "generatedAt": "2026-09-07T18:41:00.000Z",
+    "scriptVersion": "3.0.0",
+    "replicaSetName": "rs-prod-eu",
+    "seedHost": "h1:27017",
+    "mode": "multi-node",
+    "capabilities": { "canWriteFiles": true, "canOpenConnections": true },
+    "config": { "DROP_MIN_COUNTER_DAYS": 14, "SAMPLE_SIZE": 100 }
+  },
+  "members": [
+    { "id": 0, "host": "h1:27017", "role": "primary", "hidden": false, "delaySecs": 0, "votes": 1, "reachable": true, "error": null },
+    { "id": 1, "host": "h2:27017", "role": "secondary", "hidden": false, "delaySecs": 0, "votes": 1, "reachable": true, "error": null },
+    { "id": 2, "host": "h3:27017", "role": "secondary", "hidden": true, "delaySecs": 0, "votes": 1, "reachable": false, "error": "HostUnreachable" }
+  ],
+  "gaps": {
+    "unreachableMembers": [{ "host": "h3:27017", "error": "HostUnreachable" }],
+    "skipped": [{ "member": "h1:27017", "ns": "shop.big_archive", "reason": "MaxTimeMSExpired" }]
+  },
+  "namespaces": [
+    { "ns": "shop.orders", "db": "shop", "coll": "orders", "presentOn": ["h1:27017", "h2:27017"], "hasValidator": true, "sample": { "size": 100, "member": "h1:27017" } },
+    { "ns": "shop.customers", "db": "shop", "coll": "customers", "presentOn": ["h1:27017", "h2:27017"], "hasValidator": false, "sample": { "size": 100, "member": "h1:27017" } },
+    { "ns": "crm.contacts", "db": "crm", "coll": "contacts", "presentOn": ["h1:27017", "h2:27017"], "hasValidator": true, "sample": { "size": 100, "member": "h2:27017" } }
+  ],
+  "indexes": [
+    {
+      "ns": "shop.orders", "name": "status_1_createdAt_1", "key": { "status": 1, "createdAt": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-06-01T00:00:00.000Z", "counterAgeDays": 98, "sizeBytes": 41943040, "reusableBytes": 20971520, "cacheBytes": 1048576, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 0, "since": "2026-06-01T00:00:00.000Z", "counterAgeDays": 98, "sizeBytes": 41500000, "reusableBytes": 19000000, "cacheBytes": 900000, "error": null }
+      ],
+      "maxOps": 0, "minCounterAgeDays": 98, "clusterSizeBytes": 83443040, "perMemberSizeBytes": 41721520,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "drop",
+      "flags": [],
+      "reasons": ["zero operations on every reachable member for 98 days, well past the 14-day threshold"]
+    },
+    {
+      "ns": "shop.orders", "name": "status_1", "key": { "status": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-08-10T00:00:00.000Z", "counterAgeDays": 28, "sizeBytes": 10485760, "reusableBytes": 4194304, "cacheBytes": 262144, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 0, "since": "2026-08-10T00:00:00.000Z", "counterAgeDays": 28, "sizeBytes": 10300000, "reusableBytes": 4000000, "cacheBytes": 250000, "error": null }
+      ],
+      "maxOps": 0, "minCounterAgeDays": 28, "clusterSizeBytes": 20785760, "perMemberSizeBytes": 10392880,
+      "redundancy": { "class": "prefix", "coveredBy": "status_1_createdAt_1" },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "likely-drop",
+      "flags": ["redundant:prefix"],
+      "reasons": ["zero operations for 28 days, past the 14-day threshold", "key pattern is a strict prefix of status_1_createdAt_1"]
+    },
+    {
+      "ns": "shop.orders", "name": "region_1", "key": { "region": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-08-25T00:00:00.000Z", "counterAgeDays": 13, "sizeBytes": 5242880, "reusableBytes": 1048576, "cacheBytes": 65536, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 0, "since": "2026-08-25T00:00:00.000Z", "counterAgeDays": 13, "sizeBytes": 5100000, "reusableBytes": 1000000, "cacheBytes": 60000, "error": null }
+      ],
+      "maxOps": 0, "minCounterAgeDays": 13, "clusterSizeBytes": 10342880, "perMemberSizeBytes": 5171440,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "inconclusive",
+      "flags": [],
+      "reasons": ["zero operations everywhere observed, but only 13 days since the counter reset, below the 14-day threshold"]
+    },
+    {
+      "ns": "shop.orders", "name": "warehouse_1", "key": { "warehouse": 1 }, "options": {}, "hidden": true,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 412, "since": "2026-05-01T00:00:00.000Z", "counterAgeDays": 129, "sizeBytes": 7340032, "reusableBytes": 524288, "cacheBytes": 131072, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 398, "since": "2026-05-01T00:00:00.000Z", "counterAgeDays": 129, "sizeBytes": 7200000, "reusableBytes": 500000, "cacheBytes": 120000, "error": null }
+      ],
+      "maxOps": 412, "minCounterAgeDays": 129, "clusterSizeBytes": 14540032, "perMemberSizeBytes": 7270016,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "review",
+      "flags": ["hidden", "used-only-on-hidden"],
+      "reasons": ["index is hidden from the query planner but still shows operations", "hidden indexes cannot be relied on to reflect true application usage"]
+    },
+    {
+      "ns": "shop.customers", "name": "loyaltyId_1", "key": { "loyaltyId": 1 }, "options": { "sparse": true }, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-07-01T00:00:00.000Z", "counterAgeDays": 68, "sizeBytes": 2097152, "reusableBytes": 131072, "cacheBytes": 16384, "error": null },
+        { "host": "h2:27017", "present": false, "ops": 0, "since": null, "counterAgeDays": null, "sizeBytes": 0, "reusableBytes": 0, "cacheBytes": 0, "error": "IndexNotFound" }
+      ],
+      "maxOps": 0, "minCounterAgeDays": 68, "clusterSizeBytes": 2097152, "perMemberSizeBytes": 2097152,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": false, "missingOn": ["h2:27017"], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "mismatched",
+      "flags": ["mismatched"],
+      "reasons": ["index is missing on h2:27017; a definition mismatch across members means no cluster-wide verdict can be trusted"]
+    },
+    {
+      "ns": "shop.customers", "name": "email_1", "key": { "email": 1 }, "options": { "unique": true }, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 918273, "since": "2026-01-01T00:00:00.000Z", "counterAgeDays": 249, "sizeBytes": 6291456, "reusableBytes": 65536, "cacheBytes": 524288, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 887654, "since": "2026-01-01T00:00:00.000Z", "counterAgeDays": 249, "sizeBytes": 6200000, "reusableBytes": 60000, "cacheBytes": 500000, "error": null }
+      ],
+      "maxOps": 918273, "minCounterAgeDays": 249, "clusterSizeBytes": 12491456, "perMemberSizeBytes": 6245728,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "keep",
+      "flags": [],
+      "reasons": ["heavily used on every reachable member"]
+    },
+    {
+      "ns": "crm.contacts", "name": "phone_1", "key": { "phone": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-06-15T00:00:00.000Z", "counterAgeDays": 84, "sizeBytes": 3145728, "reusableBytes": 262144, "cacheBytes": 32768, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 0, "since": "2026-06-15T00:00:00.000Z", "counterAgeDays": 84, "sizeBytes": 3000000, "reusableBytes": 250000, "cacheBytes": 30000, "error": null }
+      ],
+      "maxOps": 0, "minCounterAgeDays": 84, "clusterSizeBytes": 6145728, "perMemberSizeBytes": 3072864,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [{ "field": "phone", "text": "sampled 100 documents; 97 had a non-numeric string in \"phone\" while the index key is declared numeric-friendly, suggesting the field's actual type diverges from how the index is used" }] },
+      "verdict": "drop",
+      "flags": ["suspect-field"],
+      "reasons": ["zero operations for 84 days", "sampled documents show a type mismatch on the indexed field, consistent with dead application code"]
+    },
+    {
+      "ns": "crm.contacts", "name": "company_1_title_1", "key": { "company": 1, "title": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 0, "since": "2026-06-15T00:00:00.000Z", "counterAgeDays": 84, "sizeBytes": 4194304, "reusableBytes": 0, "cacheBytes": 0, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 12, "since": "2026-06-15T00:00:00.000Z", "counterAgeDays": 84, "sizeBytes": 4100000, "reusableBytes": 0, "cacheBytes": 0, "error": null }
+      ],
+      "maxOps": 12, "minCounterAgeDays": 84, "clusterSizeBytes": 8294304, "perMemberSizeBytes": 4147152,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "keep",
+      "flags": [],
+      "reasons": ["used on at least one reachable member, so it is retained even though usage is low"]
+    },
+    {
+      "ns": "crm.contacts", "name": "_id_", "key": { "_id": 1 }, "options": {}, "hidden": false,
+      "perNode": [
+        { "host": "h1:27017", "present": true, "ops": 51234, "since": "2026-01-01T00:00:00.000Z", "counterAgeDays": 249, "sizeBytes": 1048576, "reusableBytes": 0, "cacheBytes": 65536, "error": null },
+        { "host": "h2:27017", "present": true, "ops": 49876, "since": "2026-01-01T00:00:00.000Z", "counterAgeDays": 249, "sizeBytes": 1000000, "reusableBytes": 0, "cacheBytes": 60000, "error": null }
+      ],
+      "maxOps": 51234, "minCounterAgeDays": 249, "clusterSizeBytes": 2048576, "perMemberSizeBytes": 1024288,
+      "redundancy": { "class": "none", "coveredBy": null },
+      "definition": { "consistent": true, "missingOn": [], "variants": [] },
+      "schema": { "checks": [] },
+      "verdict": "keep",
+      "flags": [],
+      "reasons": ["the _id index is always kept"]
+    }
+  ]
+}
