@@ -31,6 +31,123 @@
   const toMB = (bytes) => (Number(bytes ?? 0) / MB).toFixed(2);
   const line = '='.repeat(96);
 
+  // ------------------------------ live layer --------------------------------
+  // Talks to a real (or fake, in tests) MongoDB connection: capability probing,
+  // replica-set member discovery, and per-member collection of index metadata.
+
+  function probeCapabilities({ requireFn, MongoCtor, seedHost }) {
+    var fsModule = null;
+    try { fsModule = requireFn('fs'); } catch (e) { fsModule = null; }
+    var canOpen = false;
+    try { new MongoCtor(seedHost); canOpen = true; } catch (e) { canOpen = false; }
+    return {
+      canWriteFiles: Boolean(fsModule && fsModule.writeFileSync),
+      canOpenConnections: canOpen,
+      fs: fsModule,
+    };
+  }
+
+  function uriFor(template, host) {
+    if (!String(template).includes('{host}')) {
+      throw new Error('URI_TEMPLATE must contain {host}');
+    }
+    return String(template).split('{host}').join(host);
+  }
+
+  function discoverMembers(adminDb, config) {
+    const hello = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+    if (hello.msg === 'isdbgrid') {
+      throw new Error('connected to a mongos: sharded clusters are not supported, because '
+        + 'rs.conf() does not exist there - connect to a member of one shard instead');
+    }
+    let rsConfig = null;
+    try {
+      rsConfig = adminDb.runCommand({ replSetGetConfig: 1, maxTimeMS: config.MAX_TIME_MS }).config;
+    } catch (e) {
+      rsConfig = null;
+    }
+    if (!rsConfig) {
+      return {
+        replicaSetName: 'standalone',
+        mode: 'single-node',
+        members: [{ id: 0, host: config.SEED_HOST ?? 'seed', role: 'unknown', hidden: false,
+                    delaySecs: 0, votes: 1, reachable: true, error: null }],
+      };
+    }
+    const members = rsConfig.members
+      .filter((m) => !m.arbiterOnly)
+      .filter((m) => config.INCLUDE_HIDDEN || !m.hidden)
+      .map((m) => ({
+        id: m._id, host: m.host, role: 'unknown', hidden: Boolean(m.hidden),
+        delaySecs: Number(m.secondaryDelaySecs ?? m.slaveDelay ?? 0),
+        votes: Number(m.votes ?? 1), reachable: false, error: null,
+      }));
+    return { replicaSetName: rsConfig._id, mode: 'multi-node', members };
+  }
+
+  // Controller ruling R2: member identity comes from the replica-set config,
+  // passed in explicitly as `host`, not from `conn.host` (unverified in mongosh).
+  // The explicit argument wins; conn.host remains only as a fallback.
+  function collectFromNode(conn, config, host) {
+    conn.setReadPref('secondaryPreferred');
+    const result = { host: host ?? conn.host, namespaces: [], collections: {}, skipped: [] };
+    const excluded = new Set(config.EXCLUDED_DBS);
+
+    const dbNames = conn
+      .adminCommand({ listDatabases: 1, nameOnly: true, maxTimeMS: config.MAX_TIME_MS })
+      .databases.map((d) => d.name).filter((n) => !excluded.has(n)).sort();
+
+    for (const dbName of dbNames) {
+      let collNames = [];
+      try {
+        collNames = conn.getDB(dbName)
+          .getCollectionInfos({ type: 'collection' }, { nameOnly: true })
+          .map((c) => c.name).filter((n) => !n.startsWith('system.')).sort();
+      } catch (e) {
+        result.skipped.push({ ns: dbName, reason: e.codeName ?? e.message });
+        continue;
+      }
+      for (const collName of collNames) {
+        const ns = `${dbName}.${collName}`;
+        const entry = { indexes: [], usage: {}, storage: {}, error: null };
+        try {
+          const coll = conn.getDB(dbName).getCollection(collName);
+          const shardDocs = coll
+            .aggregate([{ $collStats: { storageStats: {} } }], { maxTimeMS: config.MAX_TIME_MS })
+            .toArray();
+          for (const doc of shardDocs) {
+            const s = doc.storageStats ?? {};
+            for (const [name, size] of Object.entries(s.indexSizes ?? {})) {
+              const e = entry.storage[name] ?? (entry.storage[name] =
+                { sizeBytes: 0, reusableBytes: 0, cacheBytes: 0 });
+              e.sizeBytes += Number(size ?? 0);
+            }
+            for (const [name, det] of Object.entries(s.indexDetails ?? {})) {
+              const e = entry.storage[name] ?? (entry.storage[name] =
+                { sizeBytes: 0, reusableBytes: 0, cacheBytes: 0 });
+              e.reusableBytes += Number(det?.['block-manager']?.['file bytes available for reuse'] ?? 0);
+              e.cacheBytes += Number(det?.cache?.['bytes currently in the cache'] ?? 0);
+            }
+          }
+          for (const st of coll.aggregate([{ $indexStats: {} }],
+              { maxTimeMS: config.MAX_TIME_MS }).toArray()) {
+            const e = entry.usage[st.name]
+              ?? (entry.usage[st.name] = { ops: 0, since: st.accesses.since });
+            e.ops += Number(st.accesses.ops);
+            if (st.accesses.since < e.since) e.since = st.accesses.since;
+          }
+          entry.indexes = coll.getIndexes();
+        } catch (e) {
+          entry.error = e.codeName ?? e.message;
+        }
+        result.namespaces.push(ns);
+        result.collections[ns] = entry;
+      }
+    }
+    return result;
+  }
+  // --------------------------------------------------------------------------
+
   const summary = {
     databases: 0,
     collections: 0,
@@ -888,7 +1005,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
