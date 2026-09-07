@@ -83,3 +83,33 @@ test('no sample and no validator yields no issues', () => {
   const none = { size: 0, paths: {}, validator: null };
   assert.deepEqual(classifySchemaIssues({ name: 'a_1', key: { a: 1 } }, none, CONFIG), []);
 });
+
+test('a top-level field absent from a closed validator is provable', () => {
+  const closed = { size: 0, paths: {}, validator: { props: ['a'], closed: true } };
+  const spec = { name: 'b_1', key: { b: 1 } };
+  const issues = classifySchemaIssues(spec, closed, CONFIG);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].issue, 'not-in-validator');
+  assert.equal(issues[0].provable, true);
+  assert.match(issues[0].text, /forbids additional properties/);
+});
+
+test('a nested field absent from a closed validator is not provable', () => {
+  const closed = { size: 0, paths: {}, validator: { props: ['address'], closed: true } };
+  const spec = { name: 'address_zip_1', key: { 'address.zip': 1 } };
+  const issues = classifySchemaIssues(spec, closed, CONFIG);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].issue, 'not-in-validator');
+  assert.equal(issues[0].provable, false);
+  assert.match(issues[0].text, /nested level is unverified/);
+});
+
+test('a field absent from an open validator is not provable', () => {
+  const open = { size: 0, paths: {}, validator: { props: ['a'], closed: false } };
+  const spec = { name: 'b_1', key: { b: 1 } };
+  const issues = classifySchemaIssues(spec, open, CONFIG);
+  assert.equal(issues.length, 1);
+  assert.equal(issues[0].issue, 'not-in-validator');
+  assert.equal(issues[0].provable, false);
+  assert.match(issues[0].text, /permits additional properties/);
+});

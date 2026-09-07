@@ -349,11 +349,19 @@
           text: 'indexed as multikey - the field holds an array in sampled documents' });
       }
       if (sample.validator && !sample.validator.props.includes(field)) {
-        issues.push({ ...base, issue: 'not-in-validator',
-          provable: sample.validator.closed,
-          text: sample.validator.closed
-            ? 'not declared in the collection validator, which forbids additional properties'
-            : 'not declared in the collection validator (which permits additional properties, so this is advisory)' });
+        const isTopLevel = !field.includes('.');
+        const provable = sample.validator.closed && isTopLevel;
+        let text;
+        if (sample.validator.closed) {
+          if (isTopLevel) {
+            text = 'not declared in the collection validator, which forbids additional properties';
+          } else {
+            text = 'not declared in the collection validator - root forbids additional properties, but this nested level is unverified (advisory)';
+          }
+        } else {
+          text = 'not declared in the collection validator (which permits additional properties, so this is advisory)';
+        }
+        issues.push({ ...base, issue: 'not-in-validator', provable, text });
       }
     }
     return issues;
