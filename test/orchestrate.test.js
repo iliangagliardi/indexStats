@@ -66,6 +66,51 @@ test('SAMPLE_SIZE of zero skips document sampling but still reads the validator'
   assert.deepEqual(s.validator, { props: ['a'], closed: false });
 });
 
+function catalogConn(docs, multikeyPathsPerIndex) {
+  return {
+    host: 'h1:27017',
+    getDB: () => ({
+      getCollectionInfos: () => [{ name: 'orders', options: {} }],
+      getCollection: () => ({
+        aggregate: (pipeline) => {
+          if (pipeline[0].$sample) return { toArray: () => docs };
+          if (pipeline[0].$listCatalog) {
+            return { toArray: () => [{ md: { indexes: multikeyPathsPerIndex.map(
+              (multikeyPaths) => ({ multikeyPaths })) } }] };
+          }
+          throw new Error('unexpected pipeline');
+        },
+      }),
+    }),
+  };
+}
+
+test('Task 11 regression: a real-server Binary bitset multikeyPaths only flags '
+  + 'paths whose byte is non-zero, not every key present', () => {
+  // $listCatalog's md.indexes[].multikeyPaths includes a key for every field of the
+  // index regardless of whether that field is actually multikey - the flag is a BSON
+  // Binary one-byte bitset (0x00 = not multikey). Object.keys() alone (the original,
+  // buggy behaviour) would flag every field; only 'tags' should end up flagged here.
+  const conn = catalogConn([{ status: 'open', tags: ['a', 'b'] }], [
+    { status: { buffer: [0] }, tags: { buffer: [1] } },
+  ]);
+  const s = sampleNamespace(conn, 'shop.orders', CONFIG);
+  assert.deepEqual(s.multikeyPaths, ['tags']);
+  assert.equal(s.paths.status.multikey, false);
+  assert.equal(s.paths.tags.multikey, true);
+});
+
+test('Task 11 regression: an older-server array-of-subpaths multikeyPaths shape '
+  + 'is still honoured (non-empty array = multikey)', () => {
+  const conn = catalogConn([{ status: 'open', tags: ['a', 'b'] }], [
+    { status: [], tags: ['tags'] },
+  ]);
+  const s = sampleNamespace(conn, 'shop.orders', CONFIG);
+  assert.deepEqual(s.multikeyPaths, ['tags']);
+  assert.equal(s.paths.status.multikey, false);
+  assert.equal(s.paths.tags.multikey, true);
+});
+
 test('a failed sample degrades that namespace only', () => {
   const conn = { host: 'h1:27017', getDB: () => ({
     getCollectionInfos: () => [{ name: 'orders', options: {} }],

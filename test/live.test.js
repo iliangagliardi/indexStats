@@ -125,14 +125,17 @@ function fakeConn() {
   return {
     host: 'h1:27017',
     setReadPref() { this.readPref = 'set'; },
-    getDB: () => ({
+    getDB: (name) => ({
       getCollectionInfos: () => [{ name: 'orders', type: 'collection' },
                                  { name: 'system.profile', type: 'collection' }],
       getCollection: coll,
+      // Real mongosh Mongo connection objects expose adminCommand only on the
+      // Database returned by getDB(), never on the connection itself - this
+      // mock must mirror that shape or it will hide the bug it once hid.
+      adminCommand: (cmd) => (cmd.listDatabases
+        ? { databases: [{ name: 'shop' }, { name: 'admin' }, { name: 'local' }, { name: 'config' }] }
+        : { ok: 1 }),
     }),
-    adminCommand: (cmd) => (cmd.listDatabases
-      ? { databases: [{ name: 'shop' }, { name: 'admin' }, { name: 'local' }, { name: 'config' }] }
-      : { ok: 1 }),
   };
 }
 
@@ -160,12 +163,13 @@ test('sets secondaryPreferred read preference before collecting', () => {
 
 test('a failing collection is skipped, not fatal', () => {
   const conn = fakeConn();
-  conn.getDB = () => ({
+  conn.getDB = (name) => ({
     getCollectionInfos: () => [{ name: 'orders', type: 'collection' }],
     getCollection: () => ({
       aggregate() { const e = new Error('timed out'); e.codeName = 'MaxTimeMSExpired'; throw e; },
       getIndexes() { return []; },
     }),
+    adminCommand: (cmd) => (cmd.listDatabases ? { databases: [{ name: 'shop' }] } : { ok: 1 }),
   });
   const r = collectFromNode(conn, CONFIG);
   assert.equal(r.collections['shop.orders'].error, 'MaxTimeMSExpired');

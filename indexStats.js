@@ -156,7 +156,13 @@
     const result = { host: host ?? conn.host, namespaces: [], collections: {}, skipped: [] };
     const excluded = new Set(config.EXCLUDED_DBS);
 
-    const dbNames = conn
+    // Bug fixed by real-cluster testing (Task 11): Mongo connection objects in
+    // mongosh have no .adminCommand of their own - only Database objects do
+    // (conn.getDB(name).adminCommand). Calling it directly on `conn` throws
+    // "conn.adminCommand is not a function" on every real member; the unit-test
+    // mock had wired a fake `adminCommand` straight onto its fake conn, matching
+    // the bug instead of catching it.
+    const dbNames = conn.getDB('admin')
       .adminCommand({ listDatabases: 1, nameOnly: true, maxTimeMS: config.MAX_TIME_MS })
       .databases.map((d) => d.name).filter((n) => !excluded.has(n)).sort();
 
@@ -344,7 +350,17 @@
 
         for (const m of reachable) {
           const coll = byHost.get(m.host)?.collections[ns];
-          const spec = coll?.indexes?.find((s) => s.name === name);
+          // Verified bug (Task 11, real mongosh 2.9.2 --file execution, not the unit
+          // tests which use plain `require` and never see it): mongosh's async-rewriter
+          // rewrites any `.find(` call - even plain Array.prototype.find, it cannot tell
+          // it apart from Collection.prototype.find - and that rewrite silently breaks
+          // when the receiver expression itself uses optional chaining directly before
+          // the call (`x?.y?.find(...)` never invokes the callback and yields undefined,
+          // or throws "this is null or not defined" depending on chain shape). Splitting
+          // the optional chaining from the `.find(` call - resolving to a plain array
+          // first - avoids the rewriter's broken code path entirely.
+          const idxList = coll?.indexes ?? [];
+          const spec = idxList.find((s) => s.name === name);
           if (!coll || !spec) {
             if (coll && !coll.error) missingOn.push(m.host);
             perNode.push({ host: m.host, present: false, ops: null, since: null,
@@ -705,7 +721,22 @@
           .aggregate([{ $listCatalog: {} }], { maxTimeMS: config.MAX_TIME_MS }).toArray();
         for (const entry of catalog) {
           for (const idx of entry?.md?.indexes ?? []) {
-            for (const p of Object.keys(idx.multikeyPaths ?? {})) {
+            // Verified bug (Task 11, real cluster): every key of multikeyPaths is present
+            // for every field of the index, whether or not that field is actually
+            // multikey - the real server (observed here on a recent build) encodes the
+            // per-path flag as a BSON Binary one-byte bitset (0x00 = not multikey, a
+            // non-zero byte = multikey), not as a boolean or as key-presence. Treating
+            // Object.keys() alone as "this path is multikey" (the original code) flagged
+            // every indexed field as multikey, including plain scalar fields like
+            // status/createdAt/_id. Older servers are documented to instead use an
+            // array-of-subpaths shape (non-empty array = multikey); both are handled,
+            // and any other/unrecognized shape defaults to "not multikey" rather than
+            // over-flagging, since false positives here are actively misleading advice.
+            for (const [p, flag] of Object.entries(idx.multikeyPaths ?? {})) {
+              const isMultikey = Array.isArray(flag)
+                ? flag.length > 0
+                : Boolean(flag?.buffer && Array.from(flag.buffer).some((b) => b !== 0));
+              if (!isMultikey) continue;
               if (!out.multikeyPaths.includes(p)) out.multikeyPaths.push(p);
               if (out.paths[p]) out.paths[p].multikey = true;
             }
@@ -767,8 +798,23 @@
     const fanOut = caps.canOpenConnections && discovered.mode === 'multi-node';
     const connFor = (host) => (fanOut ? new Mongo(uriFor(config.URI_TEMPLATE, host)) : db.getMongo());
 
+    // Verified bug (Task 11, real cluster): when !fanOut, connFor ignores its `host`
+    // argument entirely (every call returns the one local connection), but the loop
+    // below used to iterate discovered.members in rs.config order and `break` after
+    // the first - so it always attributed the local, actually-reachable connection
+    // to whichever member happens to sort first in rs.config, not to the member the
+    // script is actually running on. Running this exact degraded path directly on a
+    // secondary (127.0.0.1:27022) produced a payload claiming host 127.0.0.1:27021 -
+    // a different, potentially genuinely-unreachable member - was the one reachable.
+    // Restrict the single-connection case to the member matching the seed host we
+    // already derived (deriveSeedHost/hello().me), falling back to the full list only
+    // when that seed couldn't be matched to a configured member at all (e.g. the
+    // synthetic/unidentified-seed case, already flagged to the user separately).
+    const seedMatches = discovered.members.filter((m) => m.host === config.SEED_HOST);
+    const targets = fanOut ? discovered.members : (seedMatches.length ? seedMatches : discovered.members);
+
     const nodeResults = [];
-    for (const member of discovered.members) {
+    for (const member of targets) {
       try {
         const conn = connFor(member.host);
         const hello = conn.getDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
@@ -812,7 +858,14 @@
       config: { DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, INCLUDE_HIDDEN, MAX_TIME_MS },
     };
 
-    const withPeers = mergePeerPayloads(merged, PEER_PAYLOADS);
+    // Verified bug (Task 11, real cluster, first genuine exercise of this path):
+    // PEER_PAYLOADS is documented and printed as raw JSON text to paste in (see the
+    // "paste each payload below into PEER_PAYLOADS" message below), but mergePeerPayloads
+    // expects parsed objects (that's what every unit test in peer.test.js hands it) -
+    // passing the raw strings straight through crashed with "Cannot read properties of
+    // undefined (reading 'filter')" on the very first real paste-in. Parse here, once,
+    // at the boundary between the pasted-in raw config and the pure merge function.
+    const withPeers = mergePeerPayloads(merged, PEER_PAYLOADS.map((p) => JSON.parse(p)));
     const payload = applyAnalysis(withPeers, config, samples);
     const s = summarise(payload.indexes);
 
