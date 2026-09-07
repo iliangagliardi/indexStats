@@ -121,6 +121,124 @@
     }
     return result;
   }
+
+  function mergeNodes({ members, nodeResults, samples, now }) {
+    const at = now instanceof Date ? now : new Date();
+    const byHost = new Map(nodeResults.map((r) => [r.host, r]));
+    const reachable = members.filter((m) => m.reachable);
+    const skipped = [];
+    const nsPresence = new Map();
+
+    for (const r of nodeResults) {
+      for (const ns of r.namespaces) {
+        if (!nsPresence.has(ns)) nsPresence.set(ns, []);
+        nsPresence.get(ns).push(r.host);
+      }
+      for (const s of r.skipped) skipped.push({ member: r.host, ns: s.ns, reason: s.reason });
+      for (const [ns, coll] of Object.entries(r.collections)) {
+        if (coll.error) skipped.push({ member: r.host, ns, reason: coll.error });
+      }
+    }
+
+    const indexes = [];
+    for (const [ns, presentOn] of nsPresence) {
+      const names = new Set();
+      for (const host of presentOn) {
+        for (const spec of byHost.get(host).collections[ns]?.indexes ?? []) names.add(spec.name);
+      }
+
+      const specsForRedundancy = [];
+      const opsByName = {};
+      const built = [];
+
+      for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
+        const perNode = [];
+        const variants = new Map();
+        const missingOn = [];
+        let maxOps = 0;
+        let minAge = Infinity;
+        let clusterSize = 0;
+        let firstSpec = null;
+
+        for (const m of reachable) {
+          const coll = byHost.get(m.host)?.collections[ns];
+          const spec = coll?.indexes?.find((s) => s.name === name);
+          if (!coll || !spec) {
+            if (coll && !coll.error) missingOn.push(m.host);
+            perNode.push({ host: m.host, present: false, ops: null, since: null,
+                           counterAgeDays: null, sizeBytes: 0, reusableBytes: 0,
+                           cacheBytes: 0, error: coll?.error ?? null });
+            continue;
+          }
+          firstSpec = firstSpec ?? spec;
+          const canon = canonicalKeyString(spec.key);
+          if (!variants.has(canon)) variants.set(canon, { key: spec.key, hosts: [] });
+          variants.get(canon).hosts.push(m.host);
+
+          const use = coll.usage[name] ?? { ops: 0, since: at };
+          const store = coll.storage[name] ?? { sizeBytes: 0, reusableBytes: 0, cacheBytes: 0 };
+          const ops = Number(use.ops ?? 0);
+          const since = use.since instanceof Date ? use.since : new Date(use.since);
+          const ageDays = (at.getTime() - since.getTime()) / 86400000;
+
+          maxOps = Math.max(maxOps, ops);
+          minAge = Math.min(minAge, ageDays);
+          clusterSize += store.sizeBytes;
+          perNode.push({ host: m.host, present: true, ops, since,
+                         counterAgeDays: ageDays, sizeBytes: store.sizeBytes,
+                         reusableBytes: store.reusableBytes,
+                         cacheBytes: store.cacheBytes, error: null });
+        }
+
+        const presentNodes = perNode.filter((n) => n.present);
+        const { name: _n, key: _k, v: _v, ns: _ns, ...options } = firstSpec ?? { key: {} };
+        built.push({
+          ns, name,
+          key: firstSpec?.key ?? {},
+          options,
+          hidden: Boolean(firstSpec?.hidden),
+          perNode, maxOps,
+          minCounterAgeDays: minAge === Infinity ? null : minAge,
+          clusterSizeBytes: clusterSize,
+          perMemberSizeBytes: presentNodes.length
+            ? Math.round(clusterSize / presentNodes.length) : 0,
+          redundancy: { class: null, coveredBy: null },
+          definition: {
+            consistent: missingOn.length === 0 && variants.size <= 1,
+            missingOn,
+            variants: [...variants.values()],
+          },
+        });
+        if (firstSpec) specsForRedundancy.push(firstSpec);
+        opsByName[name] = maxOps;
+      }
+
+      const red = classifyRedundancy(specsForRedundancy, opsByName);
+      for (const idx of built) {
+        if (red.has(idx.name)) idx.redundancy = red.get(idx.name);
+        indexes.push(idx);
+      }
+    }
+
+    return {
+      members,
+      gaps: {
+        unreachableMembers: members.filter((m) => !m.reachable)
+          .map((m) => ({ host: m.host, error: m.error })),
+        skipped,
+      },
+      namespaces: [...nsPresence.entries()].map(([ns, presentOn]) => {
+        const sample = samples.find((s) => s.ns === ns) ?? null;
+        return {
+          ns, db: ns.split('.')[0], coll: ns.split('.').slice(1).join('.'),
+          presentOn,
+          hasValidator: Boolean(sample?.validator),
+          sample: sample ? { size: sample.size, member: sample.member } : null,
+        };
+      }),
+      indexes,
+    };
+  }
   // --------------------------------------------------------------------------
 
   function main() {
@@ -263,7 +381,7 @@
     print(`|${line}`);
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
