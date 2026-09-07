@@ -49,6 +49,10 @@
   const INCLUDE_HIDDEN = true;
   const DROP_MIN_COUNTER_DAYS = 14;
   const SAMPLE_SIZE = 100;
+  // Escape hatch for shells that cannot open connections to other members
+  // (e.g. Compass's embedded shell): paste each member's own run's printed
+  // PEER_PAYLOAD block in here to get a merged, cluster-wide report.
+  const PEER_PAYLOADS = [];
   // --------------------------------------------------------------------------
 
   // ------------------------------ live layer --------------------------------
@@ -390,6 +394,79 @@
     };
   }
 
+  // Pure merge of a local payload with peer payloads pasted by hand into
+  // PEER_PAYLOADS (escape hatch for shells that cannot open connections to
+  // other members, e.g. Compass's embedded shell). Unions members and
+  // per-node vectors by host, recomputes cluster-wide aggregates and
+  // definition.missingOn, and STRIPS any verdicts/flags/reasons carried over
+  // from a peer - those were derived from that peer's partial view and must
+  // never be trusted. applyAnalysis must re-derive every verdict from the
+  // union of per-member evidence afterwards.
+  function mergePeerPayloads(local, peers) {
+    if (!peers || peers.length === 0) return local;
+    const out = JSON.parse(JSON.stringify(local));
+    const hosts = new Set(out.members.map((m) => m.host));
+    const byKey = new Map(out.indexes.map((i) => [`${i.ns} ${i.name}`, i]));
+
+    for (const peer of peers) {
+      const newMembers = peer.members.filter((m) => !hosts.has(m.host));
+      for (const m of newMembers) { out.members.push(m); hosts.add(m.host); }
+      const accepted = new Set(newMembers.map((m) => m.host));
+      if (accepted.size === 0) continue;
+
+      for (const m of peer.gaps.unreachableMembers) {
+        if (!out.gaps.unreachableMembers.some((u) => u.host === m.host)) {
+          out.gaps.unreachableMembers.push(m);
+        }
+      }
+      for (const s of peer.gaps.skipped) out.gaps.skipped.push(s);
+
+      for (const ns of peer.namespaces) {
+        const existing = out.namespaces.find((n) => n.ns === ns.ns);
+        if (!existing) out.namespaces.push(ns);
+        else for (const h of ns.presentOn) {
+          if (!existing.presentOn.includes(h)) existing.presentOn.push(h);
+        }
+      }
+
+      for (const idx of peer.indexes) {
+        const nodes = idx.perNode.filter((n) => accepted.has(n.host));
+        if (nodes.length === 0) continue;
+        const key = `${idx.ns} ${idx.name}`;
+        let target = byKey.get(key);
+        if (!target) {
+          target = { ...idx, perNode: [] };
+          byKey.set(key, target);
+          out.indexes.push(target);
+        }
+        target.perNode.push(...nodes);
+      }
+    }
+
+    for (const idx of out.indexes) {
+      const present = idx.perNode.filter((n) => n.present);
+      idx.maxOps = present.reduce((m, n) => Math.max(m, Number(n.ops ?? 0)), 0);
+      const ages = present.map((n) => n.counterAgeDays)
+        .filter((a) => a !== null && a !== undefined);
+      idx.minCounterAgeDays = ages.length ? Math.min(...ages) : null;
+      idx.clusterSizeBytes = present.reduce((s, n) => s + Number(n.sizeBytes ?? 0), 0);
+      idx.perMemberSizeBytes = present.length ? Math.round(idx.clusterSizeBytes / present.length) : 0;
+      const missingOn = out.members
+        .filter((m) => m.reachable && !present.some((n) => n.host === m.host))
+        .map((m) => m.host);
+      idx.definition = {
+        ...idx.definition,
+        missingOn,
+        consistent: missingOn.length === 0 && (idx.definition.variants?.length ?? 0) <= 1,
+      };
+      delete idx.verdict;
+      delete idx.flags;
+      delete idx.reasons;
+    }
+    out.meta = { ...out.meta, mode: 'merged-payloads' };
+    return out;
+  }
+
   // --------------------------------------------------------------------------
   // Schema and index consistency checks
   // --------------------------------------------------------------------------
@@ -665,7 +742,8 @@
       config: { DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, INCLUDE_HIDDEN, MAX_TIME_MS },
     };
 
-    const payload = applyAnalysis(merged, config, samples);
+    const withPeers = mergePeerPayloads(merged, PEER_PAYLOADS);
+    const payload = applyAnalysis(withPeers, config, samples);
     const s = summarise(payload.indexes);
 
     emit(renderHTML(payload), payload, caps, config,
@@ -675,6 +753,16 @@
       + `${payload.members.filter((m) => m.reachable).length}/${payload.members.length} members`);
     print(`${s.drop} drop candidates, ${s.inconclusive} inconclusive, `
       + `${fmtBytes(s.reclaimable)} reclaimable cluster-wide`);
+
+    if (!fanOut) {
+      print(`this shell analysed only ${config.SEED_HOST}: `
+        + (caps.canOpenConnections
+          ? 'the deployment is not a replica set'
+          : 'connections to other members are not permitted here'));
+      print('for cluster-wide verdicts, run this script on each member and paste each '
+        + 'payload below into PEER_PAYLOADS');
+      print(`PEER_PAYLOAD_BEGIN\n${JSON.stringify(payload)}\nPEER_PAYLOAD_END`);
+    }
   }
 
   const VERDICT_ORDER = ['drop', 'likely-drop', 'review', 'inconclusive', 'mismatched', 'keep'];
@@ -1056,7 +1144,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

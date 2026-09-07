@@ -45,3 +45,7 @@ test('URI_TEMPLATE contains {host} and directConnection=true', () => {
   assert.ok(api.URI_TEMPLATE.includes('{host}'));
   assert.ok(api.URI_TEMPLATE.includes('directConnection=true'));
 });
+
+test('PEER_PAYLOADS defaults to an empty array', () => {
+  assert.deepEqual(api.PEER_PAYLOADS, []);
+});
