@@ -109,3 +109,34 @@ test('emit falls back to printing when the write throws', () => {
   assert.match(prints.join('\n'), /EACCES/);
   assert.equal(prints.join('\n').includes('<html>y</html>'), true);
 });
+
+const { deriveSeedHost } = require('../indexStats.js');
+
+test('deriveSeedHost prefers hello.me (replSetGetConfig-compatible host:port)', () => {
+  const adminDb = { runCommand: () => ({ me: 'h1.example.com:27017' }) };
+  const dbHandle = { serverStatus: () => { throw new Error('should not be called'); } };
+  const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
+  assert.deepEqual(r, { host: 'h1.example.com:27017', synthetic: false });
+});
+
+test('deriveSeedHost falls back to serverStatus().host when hello has no me (verified real output)', () => {
+  const adminDb = { runCommand: () => ({}) };
+  const dbHandle = { serverStatus: () => ({ host: 'M-CJ7P325Q7J:27099' }) };
+  const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
+  assert.deepEqual(r, { host: 'M-CJ7P325Q7J:27099', synthetic: false });
+});
+
+test('deriveSeedHost falls through a privilege error to the next source rather than aborting', () => {
+  const adminDb = { runCommand: () => { const e = new Error('not authorized'); e.codeName = 'Unauthorized'; throw e; } };
+  const dbHandle = { serverStatus: () => ({ host: 'fallback:27017' }) };
+  const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
+  assert.deepEqual(r, { host: 'fallback:27017', synthetic: false });
+});
+
+test('deriveSeedHost returns a synthetic, flagged literal only as a last resort', () => {
+  const adminDb = { runCommand: () => { throw new Error('nope'); } };
+  const dbHandle = { serverStatus: () => { throw new Error('nope'); } };
+  const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
+  assert.equal(r.synthetic, true);
+  assert.equal(typeof r.host, 'string');
+});

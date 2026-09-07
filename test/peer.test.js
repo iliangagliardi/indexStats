@@ -68,3 +68,94 @@ test('carried-over peer verdicts are stripped, never trusted', () => {
 test('an empty peer list leaves the local payload mode unchanged', () => {
   assert.equal(mergePeerPayloads(single('h1', 0, 40, 'likely-drop'), []).meta.mode, 'single-node');
 });
+
+// --- Realistic payload shapes (all replica-set members listed, only the seed
+// reachable, placeholder perNode entries for the rest) --------------------
+// Reproduces the controller's three-member scenario: this is what a real,
+// non-fan-out run on each of h1/h2/h3 actually produces via discoverMembers +
+// mergeNodes, NOT the single-member fixtures above.
+function realistic(host, members, ops, ageDays) {
+  const others = members.filter((h) => h !== host);
+  return {
+    meta: { mode: 'single-node', replicaSetName: 'rs0' },
+    members: [
+      { id: 0, host, role: 'primary', hidden: false, delaySecs: 0, votes: 1,
+        reachable: true, error: null },
+      ...others.map((h, i) => ({ id: i + 1, host: h, role: 'unknown', hidden: false,
+        delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' })),
+    ],
+    gaps: {
+      unreachableMembers: others.map((h) => ({ host: h, error: 'connection refused' })),
+      skipped: [],
+    },
+    namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: [host],
+                   hasValidator: false, sample: null }],
+    indexes: [{
+      ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
+      // mergeNodes only ever emits perNode entries for reachable members -
+      // there is no placeholder perNode entry for h2/h3 here.
+      perNode: [{ host, present: true, ops, since: null, counterAgeDays: ageDays,
+                  sizeBytes: 500, reusableBytes: 0, cacheBytes: 0, error: null }],
+      maxOps: ops, minCounterAgeDays: ageDays, clusterSizeBytes: 500, perMemberSizeBytes: 500,
+      redundancy: { class: null, coveredBy: null },
+      definition: { consistent: false, missingOn: others, variants: [{ key: { a: 1 }, hosts: [host] }] },
+      schema: { checks: [] }, verdict: 'inconclusive', flags: [], reasons: [],
+    }],
+  };
+}
+
+test('controller three-member scenario: peer evidence for known-unreachable hosts is accepted', () => {
+  const members = ['h1', 'h2', 'h3'];
+  const local = realistic('h1', members, 0, 40);
+  const peerB = realistic('h2', members, 0, 40);
+  const peerC = realistic('h3', members, 9000, 40); // analytics member, heavy usage
+
+  const merged = mergePeerPayloads(local, [peerB, peerC]);
+  const idx = merged.indexes[0];
+
+  assert.equal(merged.members.length, 3);
+  assert.equal(idx.perNode.length, 3, 'expected perNode entries for all three hosts');
+  assert.equal(idx.maxOps, 9000, 'expected h3\'s 9000 ops to be counted');
+  assert.equal(idx.clusterSizeBytes, 1500);
+  assert.deepEqual(merged.gaps.unreachableMembers, []);
+
+  const reAnalysed = applyAnalysis(merged, CONFIG, []);
+  assert.equal(reAnalysed.indexes[0].verdict, 'keep');
+});
+
+test('re-pasting the same realistic payload does not double-count or duplicate perNode entries', () => {
+  const members = ['h1', 'h2', 'h3'];
+  const local = realistic('h1', members, 0, 40);
+  const peerB = realistic('h2', members, 5, 40);
+
+  const once = mergePeerPayloads(local, [peerB]);
+  const twice = mergePeerPayloads(once, [peerB]);
+
+  assert.equal(twice.members.length, 3);
+  assert.equal(twice.indexes[0].perNode.length, 2);
+  assert.equal(twice.indexes[0].clusterSizeBytes, 1000);
+});
+
+test('a host no payload ever covers stays unreachable and still forces inconclusive', () => {
+  const members = ['h1', 'h2', 'h3'];
+  const local = realistic('h1', members, 0, 40);
+  const peerB = realistic('h2', members, 0, 40);
+  // h3 is never covered by any payload.
+
+  const merged = mergePeerPayloads(local, [peerB]);
+  assert.deepEqual(merged.gaps.unreachableMembers.map((m) => m.host), ['h3']);
+
+  const reAnalysed = applyAnalysis(merged, CONFIG, []);
+  assert.equal(reAnalysed.indexes[0].verdict, 'inconclusive');
+});
+
+test('gaps.skipped is deduped by {member, ns, reason}', () => {
+  const members = ['h1', 'h2'];
+  const local = realistic('h1', members, 0, 40);
+  local.gaps.skipped.push({ member: 'h2', ns: 'shop.widgets', reason: 'Unauthorized' });
+  const peerB = realistic('h2', members, 0, 40);
+  peerB.gaps.skipped.push({ member: 'h2', ns: 'shop.widgets', reason: 'Unauthorized' });
+
+  const merged = mergePeerPayloads(local, [peerB]);
+  assert.equal(merged.gaps.skipped.length, 1);
+});

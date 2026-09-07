@@ -78,6 +78,34 @@
     return String(template).split('{host}').join(host);
   }
 
+  // Verified against a live mongod (mongosh 2.9.2): `db.getMongo().host` is
+  // `undefined`, so it cannot be trusted to identify the seed member. An
+  // undefined SEED_HOST means `discoverMembers`' single-node fallback labels
+  // its member 'seed' for every host, which would make payloads pasted from
+  // different members collide on one host key and silently keep a one-node
+  // report while claiming 'merged-payloads'. Fall through a chain of real
+  // sources instead, each wrapped so a privilege error tries the next rather
+  // than aborting the run:
+  //   1. hello.me - set on replica-set members, and it is exactly the
+  //      host:port form replSetGetConfig uses, so identities match.
+  //   2. serverStatus().host - verified on this machine to return
+  //      "M-CJ7P325Q7J:27099".
+  //   3. only as a last resort, a clearly-synthetic literal - callers must
+  //      treat `synthetic: true` as a signal to warn the user to set
+  //      SEED_HOST manually before pasting peer payloads, or the merge will
+  //      silently collide.
+  function deriveSeedHost(adminDb, dbHandle, config) {
+    try {
+      const me = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS }).me;
+      if (me) return { host: me, synthetic: false };
+    } catch (e) { /* fall through to serverStatus */ }
+    try {
+      const host = dbHandle.serverStatus({ maxTimeMS: config.MAX_TIME_MS }).host;
+      if (host) return { host, synthetic: false };
+    } catch (e) { /* fall through to the synthetic literal */ }
+    return { host: 'unidentified-seed', synthetic: true };
+  }
+
   function discoverMembers(adminDb, config) {
     const hello = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
     if (hello.msg === 'isdbgrid') {
@@ -402,24 +430,58 @@
   // from a peer - those were derived from that peer's partial view and must
   // never be trusted. applyAnalysis must re-derive every verdict from the
   // union of per-member evidence afterwards.
+  //
+  // Acceptance gate: `discoverMembers` reads replSetGetConfig on the LOCAL
+  // connection alone, so even a single-node run already lists every replica-
+  // set member, marking every one but the seed as an unreachable placeholder.
+  // A peer's evidence for host H must therefore be accepted whenever the
+  // local payload has no PRESENT/covered entry for H yet - whether H is
+  // absent from `members` entirely, or present only as that unreachable
+  // placeholder - not only when H is a genuinely brand-new host. A host is
+  // "covered" once some payload (local or an earlier peer in this same call)
+  // supplied a genuine reachable member entry for it; re-merging the same
+  // peer again must then be a no-op (idempotent), and a peer's genuine entry
+  // always replaces a placeholder rather than sitting beside it, so every
+  // (index, host) pair ends up with at most one perNode entry.
   function mergePeerPayloads(local, peers) {
     if (!peers || peers.length === 0) return local;
     const out = JSON.parse(JSON.stringify(local));
-    const hosts = new Set(out.members.map((m) => m.host));
+    const coveredHosts = new Set(out.members.filter((m) => m.reachable).map((m) => m.host));
     const byKey = new Map(out.indexes.map((i) => [`${i.ns} ${i.name}`, i]));
 
     for (const peer of peers) {
-      const newMembers = peer.members.filter((m) => !hosts.has(m.host));
-      for (const m of newMembers) { out.members.push(m); hosts.add(m.host); }
-      const accepted = new Set(newMembers.map((m) => m.host));
+      // Only a peer's OWN genuinely reachable members are evidence. A host
+      // already covered (by local, or by an earlier peer this call) is left
+      // alone - this is what makes re-pasting the same payload a no-op.
+      const accepted = new Set(
+        peer.members.filter((m) => m.reachable && !coveredHosts.has(m.host)).map((m) => m.host),
+      );
       if (accepted.size === 0) continue;
 
+      for (const m of peer.members) {
+        if (!accepted.has(m.host)) continue;
+        const i = out.members.findIndex((om) => om.host === m.host);
+        if (i === -1) out.members.push(m);
+        else out.members[i] = m; // replace the unreachable placeholder with genuine data
+        coveredHosts.add(m.host);
+      }
+
+      // Reconcile gaps: a host we just covered can no longer be "unreachable",
+      // and any host neither local nor any peer has covered must stay so.
+      out.gaps.unreachableMembers = out.gaps.unreachableMembers
+        .filter((u) => !accepted.has(u.host));
       for (const m of peer.gaps.unreachableMembers) {
+        if (coveredHosts.has(m.host)) continue; // covered by local or an earlier/this peer
         if (!out.gaps.unreachableMembers.some((u) => u.host === m.host)) {
           out.gaps.unreachableMembers.push(m);
         }
       }
-      for (const s of peer.gaps.skipped) out.gaps.skipped.push(s);
+
+      for (const s of peer.gaps.skipped) {
+        const dup = out.gaps.skipped.some(
+          (e) => e.member === s.member && e.ns === s.ns && e.reason === s.reason);
+        if (!dup) out.gaps.skipped.push(s);
+      }
 
       for (const ns of peer.namespaces) {
         const existing = out.namespaces.find((n) => n.ns === ns.ns);
@@ -439,6 +501,12 @@
           byKey.set(key, target);
           out.indexes.push(target);
         }
+        // A genuine observation always beats a placeholder: drop any existing
+        // entry for a host we're about to add real data for (there shouldn't
+        // be one, since mergeNodes never emits perNode placeholders for
+        // unreachable members - but this keeps the "at most one entry per
+        // (index, host)" invariant explicit rather than assumed).
+        target.perNode = target.perNode.filter((n) => !accepted.has(n.host));
         target.perNode.push(...nodes);
       }
     }
@@ -676,8 +744,10 @@
         ? process.env.INDEXSTATS_URI : URI_TEMPLATE,
       OUT_FILE, EXCLUDED_DBS: [...EXCLUDED_DBS], MAX_TIME_MS, INCLUDE_HIDDEN,
       DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, LOW_PRESENCE,
-      SEED_HOST: db.getMongo().host,
+      SEED_HOST: undefined,
     };
+    const seed = deriveSeedHost(db.getSiblingDB('admin'), db, config);
+    config.SEED_HOST = seed.host;
     const caps = probeCapabilities({
       requireFn: typeof require === 'function' ? require
         : () => { throw new Error('no require'); },
@@ -755,12 +825,24 @@
       + `${fmtBytes(s.reclaimable)} reclaimable cluster-wide`);
 
     if (!fanOut) {
-      print(`this shell analysed only ${config.SEED_HOST}: `
-        + (caps.canOpenConnections
-          ? 'the deployment is not a replica set'
-          : 'connections to other members are not permitted here'));
-      print('for cluster-wide verdicts, run this script on each member and paste each '
-        + 'payload below into PEER_PAYLOADS');
+      if (payload.meta.mode === 'merged-payloads') {
+        print(`this shell could only reach ${config.SEED_HOST} directly, but `
+          + `${PEER_PAYLOADS.length} peer payload(s) supplied in PEER_PAYLOADS were merged in `
+          + 'for a cluster-wide report');
+      } else {
+        print(`this shell analysed only ${config.SEED_HOST}: `
+          + (caps.canOpenConnections
+            ? 'the deployment is not a replica set'
+            : 'connections to other members are not permitted here'));
+        print('for cluster-wide verdicts, run this script on each member and paste each '
+          + 'payload below into PEER_PAYLOADS');
+      }
+      if (seed.synthetic) {
+        print(`warning: this member could not identify itself (no hello.me, no `
+          + `serverStatus().host) - SEED_HOST was set to the placeholder "${config.SEED_HOST}". `
+          + 'Set SEED_HOST manually to a value unique to this member before pasting payloads, '
+          + 'or the merge will silently treat different members as the same host.');
+      }
       print(`PEER_PAYLOAD_BEGIN\n${JSON.stringify(payload)}\nPEER_PAYLOAD_END`);
     }
   }
@@ -1144,7 +1226,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
