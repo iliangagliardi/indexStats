@@ -1,23 +1,39 @@
 /**
- * indexStats.js (v2)
- * Index usage, storage and redundancy report for every collection
- * in every non-system database.
+ * indexStats.js (v3)
+ * Replica-set-wide index usage, storage, redundancy and schema-consistency
+ * report, rendered as a single self-contained HTML file.
  *
  * Run:
  *   mongosh "<connection-string>" --quiet --file indexStats.js
  *
- * What it reports per index:
- *   - access counter and counter start time ($indexStats, per-node, merged across shards)
- *   - on-disk size, reusable space (fragmentation), bytes in WiredTiger cache
- *   - UNUSED flag (zero ops on this node since the counter started)
- *   - REDUNDANT flag (a plain index whose keys are a strict prefix of another plain index)
- *   - HIDDEN flag
+ * What it does:
+ *   - discovers every member of the replica set (replSetGetConfig) and, when
+ *     the shell can open extra connections (new Mongo(...)), fans out to each
+ *     reachable member instead of reporting only the seed node
+ *   - per member: one $collStats aggregation (index sizes, WT fragmentation,
+ *     WT cache bytes), one $indexStats aggregation (ops + counter start time),
+ *     one getIndexes() - merged across members into one cluster-wide view
+ *   - samples documents ($sample) and reads collection validators on one
+ *     reachable member (preferring a hidden member, to spare the primary) to
+ *     flag indexes on fields that are rare, absent, or excluded by a strict
+ *     validator
+ *   - flags per index: UNUSED (zero ops on the sampled/merged nodes since the
+ *     counter reset), REDUNDANT (a plain index whose keys are a strict prefix
+ *     of another plain index), HIDDEN, and schema mismatches, rolled into an
+ *     advisory verdict (drop / likely-drop / review / inconclusive / keep)
+ *   - writes the report to OUT_FILE via require('fs') when the shell allows
+ *     file access, otherwise prints the whole HTML document to the console
  *
  * Safety:
+ *   - read-only: never mutates data, never drops anything - all output is advisory
  *   - views and system collections excluded up front
- *   - per-database and per-collection error isolation (one bad namespace never kills the run)
- *   - maxTimeMS on every server call so a stalled node cannot hang the report
- *   - final summary section with drop candidates, so you do not grep the report by hand
+ *   - per-database, per-collection, per-member and per-namespace-sample error
+ *     isolation (one bad namespace or unreachable member never kills the run)
+ *   - maxTimeMS on every server call so a stalled node cannot hang the report,
+ *     with one documented exception: mongosh's getCollectionInfos()/getIndexes()
+ *     helpers accept no maxTimeMS parameter
+ *   - flags are advisory only and reset-sensitive (UNUSED reflects ops since
+ *     the last counter reset on each node) - this script never runs dropIndex
  */
 
 (function indexStats() {
@@ -25,11 +41,12 @@
   const EXCLUDED_DBS = new Set(['admin', 'config', 'local']);
   const MAX_TIME_MS = 30000; // per server call
   const SCRIPT_VERSION = '3.0.0';
+  const URI_TEMPLATE = 'mongodb://{host}/?directConnection=true';
+  const OUT_FILE = 'indexStats-report.html';
+  const INCLUDE_HIDDEN = true;
+  const DROP_MIN_COUNTER_DAYS = 7;
+  const SAMPLE_SIZE = 100;
   // --------------------------------------------------------------------------
-
-  const MB = 1024 * 1024;
-  const toMB = (bytes) => (Number(bytes ?? 0) / MB).toFixed(2);
-  const line = '='.repeat(96);
 
   // ------------------------------ live layer --------------------------------
   // Talks to a real (or fake, in tests) MongoDB connection: capability probing,
@@ -170,16 +187,6 @@
     return result;
   }
   // --------------------------------------------------------------------------
-
-  const summary = {
-    databases: 0,
-    collections: 0,
-    indexes: 0,
-    totalIndexBytes: 0,
-    unused: [],     // { ns, name, sizeMB }
-    redundant: [],  // { ns, name, coveredBy }
-    skipped: [],    // { ns, reason }
-  };
 
   // ------------------------- redundancy detection ---------------------------
   // An index is a redundancy CANDIDATE when:
@@ -508,145 +515,163 @@
   }
 
   // --------------------------------------------------------------------------
+  // Sampling, orchestration and output
+  // --------------------------------------------------------------------------
+
+  // Prefers a reachable hidden member for document sampling (spares the
+  // primary), then a reachable secondary, then a reachable primary, then any
+  // reachable member. Returns null when nothing is reachable.
+  function pickSampleMember(members) {
+    const up = members.filter((m) => m.reachable);
+    return up.find((m) => m.hidden)
+      ?? up.find((m) => m.role === 'secondary')
+      ?? up.find((m) => m.role === 'primary')
+      ?? up[0] ?? null;
+  }
+
+  // Controller ruling R2: member identity comes from the replica-set config,
+  // passed in explicitly as `host`, not from `conn.host` (unverified in
+  // mongosh). The explicit argument wins; conn.host remains only as a fallback.
+  function sampleNamespace(conn, ns, config, host) {
+    const dbName = ns.split('.')[0];
+    const collName = ns.split('.').slice(1).join('.');
+    const out = { ns, member: host ?? conn.host, size: 0, paths: {},
+                  multikeyPaths: [], validator: null, error: null };
+    try {
+      const database = conn.getDB(dbName);
+      const info = database.getCollectionInfos({ name: collName })[0];
+      out.validator = validatorPaths(info?.options?.validator);
+
+      if (config.SAMPLE_SIZE > 0) {
+        const docs = database.getCollection(collName)
+          .aggregate([{ $sample: { size: config.SAMPLE_SIZE } }],
+            { maxTimeMS: config.MAX_TIME_MS })
+          .toArray();
+        const profile = profileSample(docs);
+        out.size = profile.size;
+        out.paths = profile.paths;
+      }
+
+      try {
+        const catalog = database.getCollection(collName)
+          .aggregate([{ $listCatalog: {} }], { maxTimeMS: config.MAX_TIME_MS }).toArray();
+        for (const entry of catalog) {
+          for (const idx of entry?.md?.indexes ?? []) {
+            for (const p of Object.keys(idx.multikeyPaths ?? {})) {
+              if (!out.multikeyPaths.includes(p)) out.multikeyPaths.push(p);
+              if (out.paths[p]) out.paths[p].multikey = true;
+            }
+          }
+        }
+      } catch (e) {
+        // $listCatalog needs 4.4+ and elevated privileges; it is optional enrichment
+      }
+    } catch (e) {
+      out.error = e.codeName ?? e.message;
+    }
+    return out;
+  }
+
+  // Writes the HTML report to disk when the runtime allows it, falling back
+  // to printing the whole document when it cannot (no fs, or the write throws).
+  function emit(html, payload, caps, config, out) {
+    if (caps.canWriteFiles && out.writeFileSync) {
+      try {
+        out.writeFileSync(config.OUT_FILE, html);
+        out.printFn(`report written to ${config.OUT_FILE}`);
+        return { written: true, path: config.OUT_FILE };
+      } catch (e) {
+        out.printFn(`could not write ${config.OUT_FILE} (${e.message}) - printing the report instead`);
+      }
+    } else {
+      out.printFn('this shell cannot write files - printing the report, copy it into a .html file');
+    }
+    out.printFn(html);
+    return { written: false, path: null };
+  }
 
   function main() {
-    let dbNames = [];
+    const config = {
+      URI_TEMPLATE: (typeof process === 'object' && process.env && process.env.INDEXSTATS_URI)
+        ? process.env.INDEXSTATS_URI : URI_TEMPLATE,
+      OUT_FILE, EXCLUDED_DBS: [...EXCLUDED_DBS], MAX_TIME_MS, INCLUDE_HIDDEN,
+      DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, LOW_PRESENCE,
+      SEED_HOST: db.getMongo().host,
+    };
+    const caps = probeCapabilities({
+      requireFn: typeof require === 'function' ? require
+        : () => { throw new Error('no require'); },
+      MongoCtor: typeof Mongo === 'function' ? Mongo
+        : function () { throw new Error('no Mongo'); },
+      seedHost: config.SEED_HOST,
+    });
+
+    let discovered;
     try {
-      dbNames = db
-        .adminCommand({ listDatabases: 1, nameOnly: true, maxTimeMS: MAX_TIME_MS })
-        .databases.map((d) => d.name)
-        .filter((name) => !EXCLUDED_DBS.has(name))
-        .sort();
-    } catch (err) {
-      print(`FATAL: cannot list databases: ${err.codeName ?? err.message}`);
+      discovered = discoverMembers(db.getSiblingDB('admin'), config);
+    } catch (e) {
+      print(`FATAL: ${e.message}`);
       return;
     }
 
-    for (const dbName of dbNames) {
+    const fanOut = caps.canOpenConnections && discovered.mode === 'multi-node';
+    const connFor = (host) => (fanOut ? new Mongo(uriFor(config.URI_TEMPLATE, host)) : db.getMongo());
+
+    const nodeResults = [];
+    for (const member of discovered.members) {
       try {
-        const database = db.getSiblingDB(dbName);
+        const conn = connFor(member.host);
+        const hello = conn.getDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+        member.role = (hello.isWritablePrimary || hello.ismaster) ? 'primary' : 'secondary';
+        member.reachable = true;
+        nodeResults.push(collectFromNode(conn, config, member.host));
+      } catch (e) {
+        member.reachable = false;
+        member.error = e.codeName ?? e.message;
+        print(`member ${member.host} unreachable: ${member.error}`);
+      }
+      if (!fanOut) break;
+    }
 
-        const collNames = database
-          .getCollectionInfos({ type: 'collection' }, { nameOnly: true })
-          .map((c) => c.name)
-          .filter((name) => !name.startsWith('system.'))
-          .sort();
-
-        if (collNames.length === 0) continue;
-        summary.databases++;
-
-        print(`|${line}`);
-        print(`| Database '${dbName}'`);
-        print(`|${line}`);
-
-        for (const collName of collNames) {
-          const ns = `${dbName}.${collName}`;
-          const coll = database.getCollection(collName);
-
-          try {
-            // --- one storage stats call, merged across shards ---
-            const shardDocs = coll
-              .aggregate([{ $collStats: { storageStats: {} } }], { maxTimeMS: MAX_TIME_MS })
-              .toArray();
-
-            const totals = { totalIndexSize: 0, sizes: {}, frag: {}, cache: {} };
-            for (const shardDoc of shardDocs) {
-              const s = shardDoc.storageStats ?? {};
-              totals.totalIndexSize += s.totalIndexSize ?? 0;
-              for (const [n, size] of Object.entries(s.indexSizes ?? {})) {
-                totals.sizes[n] = (totals.sizes[n] ?? 0) + size;
-              }
-              for (const [n, det] of Object.entries(s.indexDetails ?? {})) {
-                totals.frag[n] = (totals.frag[n] ?? 0) +
-                  (det?.['block-manager']?.['file bytes available for reuse'] ?? 0);
-                totals.cache[n] = (totals.cache[n] ?? 0) +
-                  (det?.cache?.['bytes currently in the cache'] ?? 0);
-              }
-            }
-
-            // --- one $indexStats call, merged across shards ---
-            const usage = new Map();
-            coll
-              .aggregate([{ $indexStats: {} }], { maxTimeMS: MAX_TIME_MS })
-              .forEach((idx) => {
-                const e = usage.get(idx.name) ?? { ops: 0, since: idx.accesses.since };
-                e.ops += Number(idx.accesses.ops);
-                if (idx.accesses.since < e.since) e.since = idx.accesses.since;
-                usage.set(idx.name, e);
-              });
-
-            // --- one getIndexes call for definitions and redundancy ---
-            const specs = coll.getIndexes();
-            const specByName = new Map(specs.map((s) => [s.name, s]));
-            const opsByName = {};
-            for (const [name, st] of usage.entries()) {
-              opsByName[name] = st.ops;
-            }
-            const redundant = classifyRedundancy(specs, opsByName);
-
-            summary.collections++;
-            summary.totalIndexBytes += totals.totalIndexSize;
-            print(`|  Collection '${collName}' - ${specs.length} indexes, total index size ${toMB(totals.totalIndexSize)} MB`);
-
-            [...usage.entries()]
-              .sort(([a], [b]) => a.localeCompare(b))
-              .forEach(([name, st]) => {
-                summary.indexes++;
-                const spec = specByName.get(name);
-                const flags = [];
-                if (st.ops === 0 && name !== '_id_') {
-                  flags.push('UNUSED');
-                  summary.unused.push({ ns, name, sizeMB: toMB(totals.sizes[name]) });
-                }
-                if (redundant.has(name)) {
-                  const dup = redundant.get(name);
-                  flags.push(`REDUNDANT (${dup.class} of '${dup.coveredBy}')`);
-                  summary.redundant.push({ ns, name, coveredBy: dup.coveredBy });
-                }
-                if (spec?.hidden) flags.push('HIDDEN');
-
-                const since = st.since instanceof Date ? st.since.toISOString() : st.since;
-                const keyStr = spec ? JSON.stringify(spec.key) : 'n/a';
-                print(`|    index '${name}' ${keyStr}${flags.length ? '   <-- ' + flags.join(', ') : ''}`);
-                print(`|      accessed ${st.ops} times since ${since}`);
-                print(`|      size ${toMB(totals.sizes[name])} MB`);
-                print(`|      reusable space (fragmentation) ${toMB(totals.frag[name])} MB`);
-                print(`|      in WiredTiger cache ${toMB(totals.cache[name])} MB`);
-              });
-          } catch (err) {
-            const reason = err.codeName ?? err.message;
-            summary.skipped.push({ ns, reason });
-            print(`|  Collection '${collName}' - skipped: ${reason}`);
-          }
-        }
-      } catch (err) {
-        const reason = err.codeName ?? err.message;
-        summary.skipped.push({ ns: dbName, reason });
-        print(`| Database '${dbName}' - skipped: ${reason}`);
+    const samples = [];
+    const sampleMember = pickSampleMember(discovered.members);
+    if (sampleMember) {
+      try {
+        const sampleConn = connFor(sampleMember.host);
+        const namespaces = (nodeResults.find((r) => r.host === sampleMember.host)
+          ?? nodeResults[0])?.namespaces ?? [];
+        for (const ns of namespaces) samples.push(sampleNamespace(sampleConn, ns, config, sampleMember.host));
+      } catch (e) {
+        print(`sampling skipped: ${e.codeName ?? e.message}`);
       }
     }
 
-    // ------------------------------- summary ----------------------------------
-    print(`|${line}`);
-    print(`| SUMMARY`);
-    print(`|${line}`);
-    print(`|  Scanned: ${summary.databases} databases, ${summary.collections} collections, ${summary.indexes} indexes`);
-    print(`|  Total index storage: ${toMB(summary.totalIndexBytes)} MB`);
+    const merged = mergeNodes({
+      members: discovered.members, nodeResults, samples, now: new Date(),
+    });
+    merged.meta = {
+      generatedAt: new Date().toISOString(),
+      scriptVersion: SCRIPT_VERSION,
+      replicaSetName: discovered.replicaSetName,
+      seedHost: config.SEED_HOST,
+      mode: fanOut ? discovered.mode : 'single-node',
+      capabilities: {
+        canWriteFiles: caps.canWriteFiles,
+        canOpenConnections: caps.canOpenConnections,
+      },
+      config: { DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, INCLUDE_HIDDEN, MAX_TIME_MS },
+    };
 
-    print(`|`);
-    print(`|  Unused on this node (${summary.unused.length}) - verify on ALL members before dropping:`);
-    summary.unused.forEach((u) => print(`|    ${u.ns} -> '${u.name}' (${u.sizeMB} MB)`));
+    const payload = applyAnalysis(merged, config, samples);
+    const s = summarise(payload.indexes);
 
-    print(`|`);
-    print(`|  Redundancy candidates (${summary.redundant.length}) - plain prefix of a wider plain index:`);
-    summary.redundant.forEach((r) => print(`|    ${r.ns} -> '${r.name}' covered by '${r.coveredBy}'`));
+    emit(renderHTML(payload), payload, caps, config,
+      { writeFileSync: caps.fs ? caps.fs.writeFileSync : null, printFn: print });
 
-    if (summary.skipped.length > 0) {
-      print(`|`);
-      print(`|  Skipped namespaces (${summary.skipped.length}):`);
-      summary.skipped.forEach((s) => print(`|    ${s.ns}: ${s.reason}`));
-    }
-    print(`|${line}`);
+    print(`${payload.indexes.length} indexes across ${payload.namespaces.length} collections on `
+      + `${payload.members.filter((m) => m.reachable).length}/${payload.members.length} members`);
+    print(`${s.drop} drop candidates, ${s.inconclusive} inconclusive, `
+      + `${fmtBytes(s.reclaimable)} reclaimable cluster-wide`);
   }
 
   const VERDICT_ORDER = ['drop', 'likely-drop', 'review', 'inconclusive', 'mismatched', 'keep'];
@@ -1028,7 +1053,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
