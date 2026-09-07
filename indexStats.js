@@ -41,10 +41,13 @@
   const EXCLUDED_DBS = new Set(['admin', 'config', 'local']);
   const MAX_TIME_MS = 30000; // per server call
   const SCRIPT_VERSION = '3.0.0';
-  const URI_TEMPLATE = 'mongodb://{host}/?directConnection=true';
+  // WARNING: this template holds a credentials placeholder ("user:pass") - do
+  // not commit this file with a real password filled in. Override at runtime
+  // via the INDEXSTATS_URI environment variable instead of editing in place.
+  const URI_TEMPLATE = 'mongodb://user:pass@{host}/?directConnection=true&appName=indexStats';
   const OUT_FILE = 'indexStats-report.html';
   const INCLUDE_HIDDEN = true;
-  const DROP_MIN_COUNTER_DAYS = 7;
+  const DROP_MIN_COUNTER_DAYS = 14;
   const SAMPLE_SIZE = 100;
   // --------------------------------------------------------------------------
 
@@ -1053,7 +1056,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
