@@ -239,6 +239,126 @@
       indexes,
     };
   }
+
+  // --------------------------------------------------------------------------
+  // Schema and index consistency checks
+  // --------------------------------------------------------------------------
+
+  const LOW_PRESENCE = 0.10;
+  const MAX_SAMPLE_DEPTH = 8;
+
+  function bsonTypeOf(v) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    if (v instanceof Date) return 'date';
+    if (v && v._bsontype) return String(v._bsontype).toLowerCase();
+    if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'double';
+    return typeof v;
+  }
+
+  function isWalkable(v) {
+    return v && typeof v === 'object' && !Array.isArray(v)
+      && !(v instanceof Date) && !v._bsontype;
+  }
+
+  function flattenPaths(doc, out = {}, prefix = '', depth = 0) {
+    if (depth > MAX_SAMPLE_DEPTH || !isWalkable(doc)) return out;
+    for (const [k, v] of Object.entries(doc)) {
+      const path = prefix ? `${prefix}.${k}` : k;
+      const entry = out[path] ?? (out[path] = { types: [], multikey: false });
+      const t = bsonTypeOf(v);
+      if (!entry.types.includes(t)) entry.types.push(t);
+      if (Array.isArray(v)) {
+        entry.multikey = true;
+        for (const el of v) flattenPaths(el, out, path, depth + 1);
+      } else {
+        flattenPaths(v, out, path, depth + 1);
+      }
+    }
+    return out;
+  }
+
+  function profileSample(docs) {
+    const paths = {};
+    for (const doc of docs) {
+      for (const [path, info] of Object.entries(flattenPaths(doc))) {
+        const entry = paths[path] ?? (paths[path] = { count: 0, types: [], multikey: false });
+        entry.count++;
+        entry.multikey = entry.multikey || info.multikey;
+        for (const t of info.types) if (!entry.types.includes(t)) entry.types.push(t);
+      }
+    }
+    return { size: docs.length, paths };
+  }
+
+  function keyFieldsOf(spec) {
+    const fields = Object.keys(spec.key ?? {});
+    const out = [];
+    for (const f of fields) {
+      if (f === '_fts' || f === '_ftsx') {
+        for (const w of Object.keys(spec.weights ?? {})) if (!out.includes(w)) out.push(w);
+        continue;
+      }
+      if (f.includes('$**')) continue;
+      out.push(f);
+    }
+    return out;
+  }
+
+  function validatorPaths(validator) {
+    const schema = validator?.$jsonSchema;
+    if (!schema) return null;
+    const props = [];
+    let closed = schema.additionalProperties === false;
+    (function walk(node, prefix) {
+      for (const [k, v] of Object.entries(node?.properties ?? {})) {
+        const path = prefix ? `${prefix}.${k}` : k;
+        props.push(path);
+        if (v && v.properties) walk(v, path);
+        if (v && v.items && v.items.properties) walk(v.items, path);
+      }
+    })(schema, '');
+    return { props, closed };
+  }
+
+  function classifySchemaIssues(spec, sample, config) {
+    const low = config?.LOW_PRESENCE ?? LOW_PRESENCE;
+    const issues = [];
+    for (const field of keyFieldsOf(spec)) {
+      const info = sample.paths?.[field] ?? null;
+      const size = sample.size ?? 0;
+      const presence = size > 0 ? (info?.count ?? 0) / size : null;
+      const base = { field, presence, sampleSize: size,
+                     types: info?.types ?? [], multikey: Boolean(info?.multikey),
+                     inValidator: sample.validator
+                       ? sample.validator.props.includes(field) : null };
+
+      if (size > 0 && presence === 0) {
+        issues.push({ ...base, issue: 'absent', provable: false,
+          text: `absent from ${size} of ${size} sampled documents on this collection` });
+      } else if (size > 0 && presence < low) {
+        issues.push({ ...base, issue: 'low-presence', provable: false,
+          text: `present in ${info.count} of ${size} sampled documents (${(presence * 100).toFixed(0)}%) - a partial or sparse index would be smaller` });
+      }
+      if (info && info.types.filter((t) => t !== 'null').length > 1) {
+        issues.push({ ...base, issue: 'mixed-types', provable: false,
+          text: `holds more than one bson type across the sample: ${info.types.join(', ')}` });
+      }
+      if (info && info.multikey) {
+        issues.push({ ...base, issue: 'unexpected-multikey', provable: false,
+          text: 'indexed as multikey - the field holds an array in sampled documents' });
+      }
+      if (sample.validator && !sample.validator.props.includes(field)) {
+        issues.push({ ...base, issue: 'not-in-validator',
+          provable: sample.validator.closed,
+          text: sample.validator.closed
+            ? 'not declared in the collection validator, which forbids additional properties'
+            : 'not declared in the collection validator (which permits additional properties, so this is advisory)' });
+      }
+    }
+    return issues;
+  }
+
   // --------------------------------------------------------------------------
 
   function main() {
@@ -381,7 +501,7 @@
     print(`|${line}`);
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
