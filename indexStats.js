@@ -50,7 +50,7 @@
   // because a single-field index can be traversed in both directions.
   const SPECIAL_OPTIONS = [
     'unique', 'sparse', 'partialFilterExpression', 'expireAfterSeconds',
-    'collation', 'wildcardProjection', 'weights', 'textIndexVersion',
+    'collation', 'hidden', 'wildcardProjection', 'weights', 'textIndexVersion',
     '2dsphereIndexVersion', 'bits', 'min', 'max',
   ];
 
@@ -61,23 +61,60 @@
     return Object.values(spec.key).every((v) => v === 1 || v === -1);
   }
 
+  function canonicalKeyString(key) {
+    return JSON.stringify(Object.entries(key));
+  }
+
+  function generatedName(key) {
+    return Object.entries(key).map(([f, d]) => `${f}_${d}`).join('_');
+  }
+
   function isStrictPrefix(shorter, longer) {
     if (shorter.length >= longer.length) return false;
     if (shorter.length === 1) return shorter[0][0] === longer[0][0];
-    return shorter.every(
-      ([field, dir], i) => longer[i][0] === field && longer[i][1] === dir
-    );
+    return shorter.every(([f, d], i) => longer[i][0] === f && longer[i][1] === d);
   }
 
-  function findRedundant(indexSpecs) {
-    const plain = indexSpecs
-      .filter(isPlain)
-      .map((s) => ({ name: s.name, keys: Object.entries(s.key) }));
-    const result = new Map(); // name -> coveredBy
+  function classifyRedundancy(specs, opsByName) {
+    const plain = specs.filter(isPlain).map((s) => ({
+      name: s.name,
+      key: s.key,
+      keys: Object.entries(s.key),
+      canon: canonicalKeyString(s.key),
+      ops: Number(opsByName?.[s.name] ?? 0),
+    }));
+    const result = new Map();
+
+    const byCanon = new Map();
+    for (const idx of plain) {
+      if (!byCanon.has(idx.canon)) byCanon.set(idx.canon, []);
+      byCanon.get(idx.canon).push(idx);
+    }
+    for (const group of byCanon.values()) {
+      if (group.length < 2) continue;
+      const survivor = [...group].sort((a, b) => {
+        if (b.ops !== a.ops) return b.ops - a.ops;
+        const ag = a.name === generatedName(a.key) ? 0 : 1;
+        const bg = b.name === generatedName(b.key) ? 0 : 1;
+        if (ag !== bg) return ag - bg;
+        return a.name.localeCompare(b.name);
+      })[0];
+      for (const idx of group) {
+        if (idx.name !== survivor.name) {
+          result.set(idx.name, { class: 'duplicate', coveredBy: survivor.name });
+        }
+      }
+    }
+
     for (const a of plain) {
+      if (result.has(a.name)) continue;
       for (const b of plain) {
-        if (a.name !== b.name && isStrictPrefix(a.keys, b.keys)) {
-          result.set(a.name, b.name);
+        if (a.name === b.name || a.canon === b.canon) continue;
+        if (isStrictPrefix(a.keys, b.keys)) {
+          result.set(a.name, {
+            class: a.keys.length === 1 && b.keys.length > 1 ? 'subsumed' : 'prefix',
+            coveredBy: b.name,
+          });
           break;
         }
       }
@@ -155,7 +192,11 @@
             // --- one getIndexes call for definitions and redundancy ---
             const specs = coll.getIndexes();
             const specByName = new Map(specs.map((s) => [s.name, s]));
-            const redundant = findRedundant(specs);
+            const opsByName = {};
+            for (const [name, st] of usage.entries()) {
+              opsByName[name] = st.ops;
+            }
+            const redundant = classifyRedundancy(specs, opsByName);
 
             summary.collections++;
             summary.totalIndexBytes += totals.totalIndexSize;
@@ -172,8 +213,9 @@
                   summary.unused.push({ ns, name, sizeMB: toMB(totals.sizes[name]) });
                 }
                 if (redundant.has(name)) {
-                  flags.push(`REDUNDANT (prefix of '${redundant.get(name)}')`);
-                  summary.redundant.push({ ns, name, coveredBy: redundant.get(name) });
+                  const dup = redundant.get(name);
+                  flags.push(`REDUNDANT (${dup.class} of '${dup.coveredBy}')`);
+                  summary.redundant.push({ ns, name, coveredBy: dup.coveredBy });
                 }
                 if (spec?.hidden) flags.push('HIDDEN');
 
@@ -221,7 +263,7 @@
     print(`|${line}`);
   }
 
-  const api = { SCRIPT_VERSION, isPlain };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
