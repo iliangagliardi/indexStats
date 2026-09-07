@@ -37,9 +37,11 @@ test('sums sizes across members and keeps per-member value', () => {
 });
 
 test('maxOps takes the highest single member, never the sum', () => {
-  const busy = node('h2', { usage: { a_1: { ops: 7, since: DAYS(30) } } });
-  const p = mergeNodes({ members, nodeResults: [node('h1'), busy], samples: [], now: NOW });
+  const lowOps = node('h1', { usage: { a_1: { ops: 3, since: DAYS(30) } } });
+  const highOps = node('h2', { usage: { a_1: { ops: 7, since: DAYS(30) } } });
+  const p = mergeNodes({ members, nodeResults: [lowOps, highOps], samples: [], now: NOW });
   assert.equal(p.indexes[0].maxOps, 7);
+  assert.notEqual(p.indexes[0].maxOps, 10);
 });
 
 test('minCounterAgeDays takes the youngest counter across members', () => {
