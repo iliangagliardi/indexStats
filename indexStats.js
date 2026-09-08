@@ -25,7 +25,7 @@
  *     sampled document, or excluded by a closed validator); and mismatched
  *     (the index's definition differs across members, or a reachable member
  *     was never observed for it at all - never a droppable verdict), rolled
- *     into an advisory verdict (drop / likely-drop / review / mismatched /
+ *     into an advisory verdict (drop / likely-drop / redundant / mismatched /
  *     inconclusive / keep)
  *   - writes the report to OUT_FILE via require('fs') when the shell allows
  *     file access, otherwise prints the whole HTML document to the console
@@ -1049,7 +1049,7 @@
     }
   }
 
-  const VERDICT_ORDER = ['drop', 'likely-drop', 'review', 'inconclusive', 'mismatched', 'keep'];
+  const VERDICT_ORDER = ['drop', 'likely-drop', 'redundant', 'inconclusive', 'mismatched', 'keep'];
 
   function deriveVerdict(idx, ctx) {
     const flags = [];
@@ -1086,8 +1086,17 @@
         reasons.unshift(`${idx.maxOps} operations on ${usedHosts.join(', ')}`);
       }
       if (idx.redundancy.class) {
-        reasons.push(`covered by '${idx.redundancy.coveredBy}', which can serve these reads`);
-        return { verdict: 'review', flags, reasons };
+        // The finding itself is definite: for the classes classifyRedundancy
+        // reports (duplicate / prefix / subsumed, all of them plain indexes),
+        // the wider index covers this one's key pattern outright, so this
+        // index should go. It is not `drop` only because it is still serving
+        // live traffic, which is a question of SEQUENCING, not of doubt -
+        // hide it, watch, then drop. Say that, rather than "review".
+        reasons.push(`redundant: '${idx.redundancy.coveredBy}' already covers this key pattern, `
+          + 'so this index should go - but it is still serving traffic, so hide it first '
+          + `(db.getSiblingDB('${idx.ns.split('.')[0]}').getCollection('${idx.ns.split('.').slice(1).join('.')}')`
+          + `.hideIndex('${idx.name}')), confirm nothing regresses, then drop it`);
+        return { verdict: 'redundant', flags, reasons };
       }
       return { verdict: 'keep', flags, reasons };
     }
@@ -1215,7 +1224,16 @@
         out.reclaimable += i.clusterSizeBytes;
       }
       if (i.verdict === 'inconclusive') out.inconclusive++;
-      if ((i.flags || []).some(function (f) { return f.indexOf('redundant') === 0; })) out.redundant++;
+      // Count the `redundant` verdict as well as the `redundant:<class>` flag,
+      // so this card can never disagree with the `redundant` chip (which
+      // matches verdict-or-flag). In practice a `redundant` verdict always
+      // carries the flag too, so this is belt and braces - but two different
+      // numbers under one label is exactly the kind of thing a reader should
+      // never have to reconcile.
+      if (i.verdict === 'redundant'
+          || (i.flags || []).some(function (f) { return f.indexOf('redundant') === 0; })) {
+        out.redundant++;
+      }
     });
     return out;
   }
@@ -1246,8 +1264,8 @@
   const CLIENT_BOOTSTRAP = `
 var DATA = JSON.parse(document.getElementById('indexstats-data').textContent);
 var STATE = { filter: 'all', search: '', sortKey: 'size', sortDir: -1 };
-var FILTERS = ['all','drop','likely-drop','inconclusive','review','mismatched','keep',
-               'redundant','suspect-field','used-only-on-hidden'];
+var FILTERS = ['all','drop','likely-drop','redundant','inconclusive','mismatched','keep',
+               'suspect-field','used-only-on-hidden'];
 function h(s){return String(s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function countFor(f){return f==='all'?DATA.indexes.length:
@@ -1383,7 +1401,7 @@ tr.idx{cursor:pointer}
 tr.idx:hover td{background:var(--card)}
 .tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px}
 .tag.drop,.tag.likely-drop{background:var(--dangerbg);color:var(--danger)}
-.tag.inconclusive,.tag.review{background:var(--warnbg);color:var(--warn)}
+.tag.inconclusive,.tag.redundant{background:var(--warnbg);color:var(--warn)}
 .tag.mismatched{background:var(--card);color:var(--fg)}
 .tag.keep{background:var(--accentbg);color:var(--accent)}
 .detail{background:var(--card)}

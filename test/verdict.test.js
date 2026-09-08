@@ -48,10 +48,10 @@ test('usage anywhere means keep', () => {
   assert.equal(deriveVerdict(idx({ maxOps: 5, perNode: [{ host: 'h1', present: true, ops: 5 }] }), CTX).verdict, 'keep');
 });
 
-test('usage plus redundancy means review, not keep', () => {
+test('usage plus redundancy means redundant, not keep', () => {
   const v = deriveVerdict(idx({ maxOps: 5, perNode: [{ host: 'h1', present: true, ops: 5 }],
     redundancy: { class: 'prefix', coveredBy: 'a_1_b_1' } }), CTX);
-  assert.equal(v.verdict, 'review');
+  assert.equal(v.verdict, 'redundant');
 });
 
 test('usage only on a hidden member is flagged', () => {

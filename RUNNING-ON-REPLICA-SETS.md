@@ -135,19 +135,49 @@ Six verdicts, in the order the table ranks them:
 |---|---|
 | `drop` | Zero ops on every member, counters old enough, **and** redundant or on a suspect field |
 | `likely-drop` | Zero ops on every member with old enough counters, on usage evidence alone |
-| `review` | Still receiving operations, but a wider index covers it |
+| `redundant` | A wider index already covers this one's key pattern, and it is still serving traffic. It should go — hide it first |
 | `inconclusive` | The evidence has a hole — see below |
 | `mismatched` | The definition differs across members, or is missing on some. Often an in-flight or stalled rolling index build |
-| `keep` | In use |
+| `keep` | In use, and not covered by anything else |
 
-Flags are independent of the verdict, and filterable: `redundant:duplicate|prefix|subsumed`,
+### On `redundant`
+
+This verdict is a statement, not a question. The script only reports redundancy for **plain**
+indexes — anything carrying `unique`, `sparse`, a partial filter, a TTL, a collation, or a
+wildcard/text/geo/hashed key is excluded, because a wider index does not carry those semantics.
+For what remains — a duplicate key pattern, a strict prefix with matching directions, or a
+single-field index leading a compound one — the wider index genuinely covers it. The index should
+be removed.
+
+The reason it is not `drop` is **sequencing, not doubt**: the index is currently serving live
+queries, so dropping it outright changes query plans under load. The safe order is to hide it,
+watch, then drop. The report hands you the exact command in the row's drill-down:
+
+```js
+db.getSiblingDB('shop').getCollection('orders').hideIndex('status_1')
+```
+
+A hidden index is invisible to the planner but still maintained, so if something regresses you
+unhide it instantly instead of rebuilding it. Once nothing has regressed, drop it.
+
+### Flags
+
+Flags are independent of the verdict and separately filterable: `redundant:duplicate|prefix|subsumed`,
 `hidden`, `suspect-field`, `mismatched`, `used-only-on-hidden`.
 
 `used-only-on-hidden` is the one to read carefully — every observed operation came from a hidden or
 delayed member. A primary-only report would have called that index unused.
 
-The **copy `dropIndexes` commands** button emits statements only for `drop` and `likely-drop`
-indexes currently shown by your filter. It emits text for you to review; nothing is executed.
+The **`redundant` chip** deliberately matches both the verdict and the flag, so clicking it shows
+*every* redundant index — including those already ranked `drop` because they are also unused. If
+you want the whole redundancy picture in one view, that is the chip.
+
+### The copy button
+
+**Copy `dropIndexes` commands** emits statements only for `drop` and `likely-drop` indexes
+currently shown by your filter — deliberately **not** for `redundant` ones, because those are still
+serving traffic and want the hide-first treatment above rather than a paste-and-run drop. Nothing
+is ever executed; it is text for you to review.
 
 ---
 

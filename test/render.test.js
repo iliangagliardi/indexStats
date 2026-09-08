@@ -130,6 +130,28 @@ test('selectIndexes filters by flag prefix', () => {
   assert.deepEqual(out.map((i) => i.name), ['x']);
 });
 
+// The `redundant` verdict shares its name with the `redundant:<class>` flag on
+// purpose: there is one chip, and it means "every index that is redundant",
+// whether or not it is also unused. Pin both halves, since dropping the old
+// separate `review` chip is what made this filter do double duty.
+test('the redundant filter matches the verdict AND the flag', () => {
+  const all = [
+    ix({ name: 'byVerdict', verdict: 'redundant', flags: [] }),
+    ix({ name: 'byFlag', verdict: 'drop', flags: ['redundant:duplicate'] }),
+    ix({ name: 'both', verdict: 'redundant', flags: ['redundant:prefix'] }),
+    ix({ name: 'neither', verdict: 'keep', flags: [] }),
+  ];
+  const out = selectIndexes(all, { filter: 'redundant', search: '', sortKey: 'size', sortDir: -1 });
+  assert.deepEqual(out.map((i) => i.name).sort(), ['both', 'byFlag', 'byVerdict']);
+});
+
+// A redundant index that is still serving traffic must never be auto-emitted
+// as a dropIndexes statement - it needs hiding and observing first. The copy
+// button stays limited to drop/likely-drop.
+test('dropCommandsFor never emits a redundant-but-in-use index', () => {
+  assert.equal(dropCommandsFor([ix({ verdict: 'redundant', flags: ['redundant:prefix'] })]).trim(), '');
+});
+
 test('selectIndexes searches namespace and index name, case-insensitively', () => {
   const all = [ix({ ns: 'crm.contacts', name: 'email_1' }), ix({ ns: 'shop.orders', name: 'a_1' })];
   const base = { filter: 'all', sortKey: 'size', sortDir: -1 };
@@ -189,7 +211,7 @@ test('dropCommandsFor JSON-escapes names containing quotes and backslashes', () 
 
 test('dropCommandsFor never emits commands for non-candidates', () => {
   const cmds = dropCommandsFor([ix({ verdict: 'keep' }), ix({ verdict: 'inconclusive' }),
-                                ix({ verdict: 'mismatched' }), ix({ verdict: 'review' })]);
+                                ix({ verdict: 'mismatched' }), ix({ verdict: 'redundant' })]);
   assert.equal(cmds.trim(), '');
 });
 
@@ -211,3 +233,18 @@ test('client functions close over nothing from the enclosing scope', () => {
 });
 
 module.exports = { payload };
+
+// The `redundant` metric card and the `redundant` chip must never show
+// different numbers for the same word: the card counts verdict-or-flag, the
+// chip filter matches verdict-or-flag. Pin them to each other.
+test('the redundant card count always equals the redundant chip count', () => {
+  const all = [
+    ix({ name: 'a', verdict: 'redundant', flags: ['redundant:prefix'] }),
+    ix({ name: 'b', verdict: 'drop', flags: ['redundant:duplicate'] }),
+    ix({ name: 'c', verdict: 'redundant', flags: [] }),
+    ix({ name: 'd', verdict: 'keep', flags: [] }),
+  ];
+  const chip = selectIndexes(all, { filter: 'redundant', search: '', sortKey: 'size', sortDir: -1 }).length;
+  assert.equal(summarise(all).redundant, chip);
+  assert.equal(chip, 3);
+});
