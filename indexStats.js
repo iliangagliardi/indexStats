@@ -59,14 +59,39 @@
   // Talks to a real (or fake, in tests) MongoDB connection: capability probing,
   // replica-set member discovery, and per-member collection of index metadata.
 
-  function probeCapabilities({ requireFn, MongoCtor, seedHost }) {
+  // FINDING 5 (final review, important): this used to probe with
+  // `new MongoCtor(seedHost)` - a bare host, no credentials, no
+  // directConnection - so canOpenConnections came back true even when every
+  // real fan-out connection (built from URI_TEMPLATE, with credentials) would
+  // fail authentication. Probe with the ACTUAL template the run will use
+  // instead, and distinguish the two ways opening it can fail, because they
+  // demand different remedies: no Mongo constructor at all (Compass-style
+  // embedded shell - use the peer-payload workflow) versus Mongo exists but
+  // the URI_TEMPLATE-built connection string didn't work (fix
+  // URI_TEMPLATE/credentials). The caller signals "no constructor" by handing
+  // in a stub that throws exactly `new Error('no Mongo')` (see main()) - when
+  // the thrown message doesn't match that marker, we cannot honestly tell the
+  // two causes apart, so we say so via 'unknown' rather than guessing.
+  function probeCapabilities({ requireFn, MongoCtor, uriTemplate, seedHost }) {
     var fsModule = null;
     try { fsModule = requireFn('fs'); } catch (e) { fsModule = null; }
     var canOpen = false;
-    try { new MongoCtor(seedHost); canOpen = true; } catch (e) { canOpen = false; }
+    var connectionBlockedReason = null;
+    try {
+      const uri = uriFor(uriTemplate, seedHost);
+      new MongoCtor(uri);
+      canOpen = true;
+    } catch (e) {
+      canOpen = false;
+      const msg = e && e.message ? e.message : String(e);
+      connectionBlockedReason = msg === 'no Mongo' ? 'no-mongo-constructor'
+        : msg.includes('URI_TEMPLATE must contain {host}') ? 'template-invalid'
+        : 'template-failed';
+    }
     return {
       canWriteFiles: Boolean(fsModule && fsModule.writeFileSync),
       canOpenConnections: canOpen,
+      connectionBlockedReason,
       fs: fsModule,
     };
   }
@@ -878,6 +903,7 @@
         : () => { throw new Error('no require'); },
       MongoCtor: typeof Mongo === 'function' ? Mongo
         : function () { throw new Error('no Mongo'); },
+      uriTemplate: config.URI_TEMPLATE,
       seedHost: config.SEED_HOST,
     });
 
@@ -977,10 +1003,26 @@
           + `${PEER_PAYLOADS.length} peer payload(s) supplied in PEER_PAYLOADS were merged in `
           + 'for a cluster-wide report');
       } else {
-        print(`this shell analysed only ${config.SEED_HOST}: `
-          + (caps.canOpenConnections
-            ? 'the deployment is not a replica set'
-            : 'connections to other members are not permitted here'));
+        // FINDING 5: tell apart the two reasons a multi-node deployment can
+        // still end up single-node here, since they demand different fixes.
+        let capReason;
+        if (discovered.mode !== 'multi-node') {
+          capReason = 'the deployment is not a replica set';
+        } else if (caps.connectionBlockedReason === 'no-mongo-constructor') {
+          capReason = 'this shell forbids opening additional connections (no Mongo '
+            + 'constructor available, e.g. Compass\'s embedded shell) - use the '
+            + 'peer-payload workflow below';
+        } else if (caps.connectionBlockedReason === 'template-failed'
+            || caps.connectionBlockedReason === 'template-invalid') {
+          capReason = 'this shell CAN open connections, but the one built from '
+            + 'URI_TEMPLATE did not work - check URI_TEMPLATE/credentials (or set '
+            + 'INDEXSTATS_URI), then re-run';
+        } else {
+          capReason = 'this shell could not open a second connection - either it '
+            + 'forbids opening connections entirely, or URI_TEMPLATE/credentials are '
+            + 'wrong; use the peer-payload workflow below, or fix URI_TEMPLATE and re-run';
+        }
+        print(`this shell analysed only ${config.SEED_HOST}: ${capReason}`);
         print('for cluster-wide verdicts, run this script on each member and paste each '
           + 'payload below into PEER_PAYLOADS');
       }

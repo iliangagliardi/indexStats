@@ -13,10 +13,13 @@ test('uriFor rejects a template without the placeholder', () => {
   assert.throws(() => uriFor('mongodb://h1:27017/', 'h2:27017'), /\{host\}/);
 });
 
+const URI_TEMPLATE = 'mongodb://user:pass@{host}/?directConnection=true';
+
 test('probeCapabilities reports false when both probes throw', () => {
   const caps = probeCapabilities({
     requireFn: () => { throw new Error('not available'); },
     MongoCtor: function () { throw new Error('forbidden'); },
+    uriTemplate: URI_TEMPLATE,
     seedHost: 'h1:27017',
   });
   assert.deepEqual({ w: caps.canWriteFiles, c: caps.canOpenConnections }, { w: false, c: false });
@@ -26,9 +29,59 @@ test('probeCapabilities reports true when both succeed', () => {
   const caps = probeCapabilities({
     requireFn: () => ({ writeFileSync() {} }),
     MongoCtor: function () { return {}; },
+    uriTemplate: URI_TEMPLATE,
     seedHost: 'h1:27017',
   });
   assert.deepEqual({ w: caps.canWriteFiles, c: caps.canOpenConnections }, { w: true, c: true });
+});
+
+// FINDING 5 (final review, important): the probe used to construct
+// `new MongoCtor(seedHost)` - a bare host, no credentials, no
+// directConnection - so it reported `canOpenConnections: true` even when
+// every REAL fan-out connection (built from URI_TEMPLATE) would fail
+// authentication. It must probe with the actual template-built URI.
+test('probeCapabilities constructs the Mongo connection from the actual URI_TEMPLATE, not a bare host', () => {
+  let seenArg = null;
+  probeCapabilities({
+    requireFn: () => ({ writeFileSync() {} }),
+    MongoCtor: function (uri) { seenArg = uri; return {}; },
+    uriTemplate: 'mongodb://svc:secret@{host}/?directConnection=true&appName=x',
+    seedHost: 'h1:27017',
+  });
+  assert.equal(seenArg, 'mongodb://svc:secret@h1:27017/?directConnection=true&appName=x');
+});
+
+test('probeCapabilities distinguishes "no Mongo constructor" from "template built, but connection failed"', () => {
+  const noMongo = probeCapabilities({
+    requireFn: () => ({ writeFileSync() {} }),
+    MongoCtor: function () { throw new Error('no Mongo'); }, // main()'s own stub for "Mongo is undefined"
+    uriTemplate: URI_TEMPLATE,
+    seedHost: 'h1:27017',
+  });
+  assert.equal(noMongo.canOpenConnections, false);
+  assert.equal(noMongo.connectionBlockedReason, 'no-mongo-constructor');
+
+  const authFailed = probeCapabilities({
+    requireFn: () => ({ writeFileSync() {} }),
+    MongoCtor: function () { const e = new Error('Authentication failed.'); e.codeName = 'AuthenticationFailed'; throw e; },
+    uriTemplate: URI_TEMPLATE,
+    seedHost: 'h1:27017',
+  });
+  assert.equal(authFailed.canOpenConnections, false);
+  assert.equal(authFailed.connectionBlockedReason, 'template-failed');
+});
+
+test('probeCapabilities reports an invalid URI_TEMPLATE distinctly, without ever calling MongoCtor', () => {
+  let called = false;
+  const caps = probeCapabilities({
+    requireFn: () => ({ writeFileSync() {} }),
+    MongoCtor: function () { called = true; return {}; },
+    uriTemplate: 'mongodb://h1:27017/', // no {host}
+    seedHost: 'h1:27017',
+  });
+  assert.equal(called, false);
+  assert.equal(caps.canOpenConnections, false);
+  assert.equal(caps.connectionBlockedReason, 'template-invalid');
 });
 
 function fakeAdmin(rsConfig, helloMsg) {
