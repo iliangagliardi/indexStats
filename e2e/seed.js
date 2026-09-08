@@ -1,4 +1,4 @@
-// test/e2e/seed.js  - run against the primary
+// e2e/seed.js  - run against the primary
 const shop = db.getSiblingDB('shop');
 shop.orders.drop();
 shop.orders.insertMany(Array.from({ length: 500 }, (_, i) => ({

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/e2e/cluster.sh
+# e2e/cluster.sh
 set -euo pipefail
 BASE="${TMPDIR:-/tmp}/indexstats-e2e"
 PORTS=(27021 27022 27023)

@@ -72,7 +72,7 @@ and reliably false in mongosh.
 
 The script must survive being loaded somewhere it cannot open extra connections and cannot write
 files - Compass's embedded shell is the reference case, and it cannot be driven from an
-automated test, so `test/e2e` simulates it under mongosh by forcing both probes to throw. Real
+automated test, so `e2e` simulates it under mongosh by forcing both probes to throw. Real
 capabilities are established once, up front, by `probeCapabilities()`:
 
 - **can this shell open extra connections?** - probed by trying `new Mongo(seedHost)` in a
@@ -88,7 +88,7 @@ strings - the script `JSON.parse`s each entry itself) and rerun on another shell
 fan out; `mergePeerPayloads` unions the evidence and `meta.mode` becomes `'merged-payloads'`.
 This is the *only* way to get a cluster-wide report from a shell that cannot open its own
 connections, so treat it as a first-class, tested path, not an afterthought - it is directly
-exercised end-to-end in `test/e2e`.
+exercised end-to-end in `e2e`.
 
 ## Member identity: never `conn.host`
 
@@ -119,17 +119,20 @@ Keep this exception; do not "fix" it by switching to the raw commands.
 
 ## Testing
 
-- **Unit tests**: `node --test test/*.test.js` (not bare `node --test`, and not
-  `node --test test/` - directory positional arguments are rejected on newer Node, and bare
-  `node --test` from the repo root also recursively sweeps up `test/e2e/*.js`, which are
-  mongosh-only driver/verifier scripts, not `node:test` suites, and will report spurious
-  failures). All units run under plain Node via `require('./indexStats.js')` - the module export
-  guard above is what makes that possible - so they exercise only the pure layer and never touch
-  a real deployment.
-- **End-to-end**: `test/e2e/cluster.sh {start|stop}` brings up three plain `mongod --fork`
+- **Unit tests**: bare `node --test` from the repo root. This works cleanly because the
+  end-to-end helpers live in a separate top-level `e2e/` directory, not under `test/` - Node's
+  default test-file discovery recursively sweeps up every `.js` file under any directory
+  literally named `test`, and `e2e/seed.js`/`e2e/verify.js` are mongosh-only driver/verifier
+  scripts, not `node:test` suites, so keeping them out of `test/` entirely (rather than filtering
+  them out with a glob or flag) is what makes the plain, documented command correct. (Note:
+  `node --test test/` - i.e. passing the directory as a positional argument - is rejected on
+  newer Node; bare `node --test` with no arguments is the form to use.) All units run under plain
+  Node via `require('./indexStats.js')` - the module export guard above is what makes that
+  possible - so they exercise only the pure layer and never touch a real deployment.
+- **End-to-end**: `e2e/cluster.sh {start|stop}` brings up three plain `mongod --fork`
   processes on loopback ports 27021-27023 as a real replica set (one member `hidden: true,
-  priority: 0`) - no containers. `test/e2e/seed.js` seeds known redundancy/schema scenarios,
-  `test/e2e/verify.js` asserts against the payload embedded in the generated report, including
+  priority: 0`) - no containers. `e2e/seed.js` seeds known redundancy/schema scenarios,
+  `e2e/verify.js` asserts against the payload embedded in the generated report, including
   the unreachable-member downgrade. This is the *only* thing that has ever caught a live-mongosh
   bug in this project (five of them, in one pass: `conn.adminCommand` doesn't exist - it's
   `conn.getDB('admin').adminCommand`; mongosh's async-rewriter breaks `x?.y?.find(...)` chains
@@ -149,7 +152,7 @@ report "cleaner" or a test pass:
   younger than this can never be recommended `drop` or `likely-drop`, no matter how idle it
   looks - `$indexStats` counters reset on restart/failover, so a young counter proves nothing. On
   a cluster seeded minutes ago, *every* verdict must downgrade to `inconclusive` (or `keep`,
-  `mismatched`, `review` where those apply) - never a drop recommendation. `test/e2e/verify.js`
+  `mismatched`, `review` where those apply) - never a drop recommendation. `e2e/verify.js`
   asserts exactly this and treats any `drop`/`likely-drop` on a freshly-seeded cluster as a
   genuine bug in the script, not a test to be adjusted.
 - **The unreachable-member downgrade.** If any replica-set member could not be reached, no index

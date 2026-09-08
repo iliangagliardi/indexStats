@@ -1,4 +1,4 @@
-// test/e2e/verify.js
+// e2e/verify.js
 const fs = require('fs');
 const assert = require('node:assert/strict');
 
