@@ -122,6 +122,31 @@ test('end-to-end: a collection-level error on one member downgrades an old, zero
 
 // Same defect via the per-database skip path (~183-186): the collection
 // never even gets an entry, so `coll` itself is undefined for that host.
+// FINDING 4 (final review, important): a member excluded by
+// INCLUDE_HIDDEN=false (main() folds discoverMembers().excludedByConfig into
+// the `members` list handed to mergeNodes) must show up in
+// gaps.unreachableMembers and downgrade a zero-ops verdict to inconclusive,
+// exactly like a genuinely unreachable member does.
+test('end-to-end: a member excluded by INCLUDE_HIDDEN=false lands in gaps.unreachableMembers and downgrades an old, zero-ops index to inconclusive', () => {
+  const membersWithExcluded = [
+    ...members,
+    { id: 2, host: 'h3', role: 'unknown', hidden: true, delaySecs: 0, votes: 0,
+      reachable: false, error: 'excluded by INCLUDE_HIDDEN=false configuration - never contacted, not unreachable' },
+  ];
+  const oldZeroOps = { usage: { a_1: { ops: 0, since: DAYS(300) } } };
+  const merged = mergeNodes({
+    members: membersWithExcluded,
+    nodeResults: [node('h1', oldZeroOps), node('h2', oldZeroOps)],
+    samples: [], now: NOW,
+  });
+  assert.deepEqual(merged.gaps.unreachableMembers.map((m) => m.host), ['h3']);
+  assert.match(merged.gaps.unreachableMembers[0].error, /INCLUDE_HIDDEN/);
+
+  const payload = applyAnalysis(merged, { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 }, []);
+  assert.equal(payload.indexes[0].verdict, 'inconclusive');
+  assert.match(payload.indexes[0].reasons.join(' '), /h3/);
+});
+
 test('a per-database skip (Unauthorized) also carries its reason onto perNode and is excluded from missingOn', () => {
   const skipped = { ...node('h1'), namespaces: [], collections: {}, skipped: [{ ns: 'shop', reason: 'Unauthorized' }] };
   const p = mergeNodes({ members, nodeResults: [skipped, node('h2')], samples: [], now: NOW });

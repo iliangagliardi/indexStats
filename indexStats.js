@@ -135,17 +135,38 @@
         mode: 'single-node',
         members: [{ id: 0, host: config.SEED_HOST ?? 'seed', role: 'unknown', hidden: false,
                     delaySecs: 0, votes: 1, reachable: true, error: null }],
+        excludedByConfig: [],
       };
     }
-    const members = rsConfig.members
-      .filter((m) => !m.arbiterOnly)
+    const toMember = (m) => ({
+      id: m._id, host: m.host, role: 'unknown', hidden: Boolean(m.hidden),
+      delaySecs: Number(m.secondaryDelaySecs ?? m.slaveDelay ?? 0),
+      votes: Number(m.votes ?? 1), reachable: false, error: null,
+    });
+    const votingMembers = rsConfig.members.filter((m) => !m.arbiterOnly);
+    const members = votingMembers
       .filter((m) => config.INCLUDE_HIDDEN || !m.hidden)
+      .map(toMember);
+    // FINDING 4 (final review, important): when INCLUDE_HIDDEN is false, the
+    // hidden members filtered out above used to vanish from the accounting
+    // entirely - they never appear in gaps.unreachableMembers either, so a
+    // zero-ops index goes straight to drop/likely-drop while the hidden
+    // analytics member (the likeliest actual user of that index) was never
+    // consulted, and nothing in the report says so. Surface them as a
+    // distinct, config-caused gap - shaped exactly like an unreachable member
+    // so the existing ctx.unreachableHosts safety gate in deriveVerdict
+    // downgrades affected verdicts, and renderMembers/renderGapsPanel show
+    // the hole - but keep them OUT of `members` (main()'s connection
+    // targets), since INCLUDE_HIDDEN=false means "never contact these", not
+    // just "don't count them".
+    const excludedByConfig = config.INCLUDE_HIDDEN ? [] : votingMembers
+      .filter((m) => m.hidden)
       .map((m) => ({
-        id: m._id, host: m.host, role: 'unknown', hidden: Boolean(m.hidden),
-        delaySecs: Number(m.secondaryDelaySecs ?? m.slaveDelay ?? 0),
-        votes: Number(m.votes ?? 1), reachable: false, error: null,
+        ...toMember(m),
+        reachable: false,
+        error: 'excluded by INCLUDE_HIDDEN=false configuration - never contacted, not unreachable',
       }));
-    return { replicaSetName: rsConfig._id, mode: 'multi-node', members };
+    return { replicaSetName: rsConfig._id, mode: 'multi-node', members, excludedByConfig };
   }
 
   // Controller ruling R2: member identity comes from the replica-set config,
@@ -911,8 +932,12 @@
       }
     }
 
+    // FINDING 4: members excluded by INCLUDE_HIDDEN=false never got connected
+    // to (discovered.members already omits them, so they were never targets
+    // above) but must still show up as a gap, not vanish from the report.
     const merged = mergeNodes({
-      members: discovered.members, nodeResults, samples, now: new Date(),
+      members: [...discovered.members, ...(discovered.excludedByConfig ?? [])],
+      nodeResults, samples, now: new Date(),
     });
     merged.meta = {
       generatedAt: new Date().toISOString(),
@@ -1382,13 +1407,32 @@ ${CLIENT_BOOTSTRAP}</script>
     module.exports = api;
   }
 
+  // FINDING 3 (final review, important): this try/catch used to wrap the
+  // main() call itself, so ANY throw from inside main() - a bad URI_TEMPLATE,
+  // a render error, an unexpected driver shape - printed only the "Connect to
+  // a database first" message, giving the DBA no report AND a wrong
+  // diagnosis (the shell IS connected; something else broke). The try/catch
+  // below now guards ONLY the capability probe (`typeof db`/`typeof print`,
+  // which is what can legitimately fail to even evaluate outside a connected
+  // mongosh shell, e.g. `mongosh --nodb`). A genuine failure inside main()
+  // gets its own distinct FATAL line with the real error, never disguised as
+  // "not connected".
+  let connected = false;
   try {
-    if (typeof db !== 'undefined' && typeof print === 'function') {
-      main();
-    }
+    connected = typeof db !== 'undefined' && typeof print === 'function';
   } catch (e) {
+    connected = false;
+  }
+
+  if (!connected) {
     if (typeof print === 'function') {
       print('| Connect to a database first: mongosh "mongodb://..." --file indexStats.js');
+    }
+  } else {
+    try {
+      main();
+    } catch (e) {
+      print(`FATAL: indexStats.js failed unexpectedly: ${e && e.message ? e.message : e}`);
     }
   }
 })();

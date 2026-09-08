@@ -77,6 +77,35 @@ test('excludes hidden members when INCLUDE_HIDDEN is false', () => {
   assert.deepEqual(members.map((m) => m.host), ['h1:27017']);
 });
 
+// FINDING 4 (final review, important): INCLUDE_HIDDEN=false used to make
+// hidden members vanish from the accounting entirely - not in `members`
+// (correct, they must never be contacted) but ALSO not recorded anywhere as
+// a gap, so a zero-ops index on the visible members looked fully confirmed
+// even though the hidden analytics member (the likeliest actual user of
+// that index) was never consulted.
+test('excluded-by-config hidden members are still reported, as a distinct non-"unreachable" reason', () => {
+  const { members, excludedByConfig } = discoverMembers(fakeAdmin({
+    _id: 'rs0',
+    members: [{ _id: 0, host: 'h1:27017' },
+              { _id: 1, host: 'h2:27017', hidden: true, priority: 0 }],
+  }), { ...CONFIG, INCLUDE_HIDDEN: false });
+  assert.deepEqual(members.map((m) => m.host), ['h1:27017'], 'still never a connection target');
+  assert.equal(excludedByConfig.length, 1);
+  assert.equal(excludedByConfig[0].host, 'h2:27017');
+  assert.equal(excludedByConfig[0].reachable, false);
+  assert.match(excludedByConfig[0].error, /INCLUDE_HIDDEN/);
+});
+
+test('excludedByConfig is empty when INCLUDE_HIDDEN is true or in single-node mode', () => {
+  const multi = discoverMembers(fakeAdmin({
+    _id: 'rs0',
+    members: [{ _id: 0, host: 'h1:27017' }, { _id: 1, host: 'h2:27017', hidden: true, priority: 0 }],
+  }), CONFIG);
+  assert.deepEqual(multi.excludedByConfig, []);
+  const single = discoverMembers(fakeAdmin(null), { ...CONFIG, SEED_HOST: 'h9:27017' });
+  assert.deepEqual(single.excludedByConfig, []);
+});
+
 test('falls back to single-node mode when replication is not enabled', () => {
   const { mode, members } = discoverMembers(fakeAdmin(null), { ...CONFIG, SEED_HOST: 'h9:27017' });
   assert.equal(mode, 'single-node');
