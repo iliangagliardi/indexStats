@@ -17,10 +17,16 @@
  *     reachable member (preferring a hidden member, to spare the primary) to
  *     flag indexes on fields that are rare, absent, or excluded by a strict
  *     validator
- *   - flags per index: UNUSED (zero ops on the sampled/merged nodes since the
- *     counter reset), REDUNDANT (a plain index whose keys are a strict prefix
- *     of another plain index), HIDDEN, and schema mismatches, rolled into an
- *     advisory verdict (drop / likely-drop / review / inconclusive / keep)
+ *   - flags per index: zero ops on every reachable, observed member since the
+ *     counter reset; redundant (a plain index that is a duplicate of, is
+ *     subsumed by, or is a strict prefix of another plain index - see
+ *     classifyRedundancy for the duplicate/subsumed/prefix classes); hidden;
+ *     used-only-on-hidden; suspect-field (a key field absent from every
+ *     sampled document, or excluded by a closed validator); and mismatched
+ *     (the index's definition differs across members, or a reachable member
+ *     was never observed for it at all - never a droppable verdict), rolled
+ *     into an advisory verdict (drop / likely-drop / review / mismatched /
+ *     inconclusive / keep)
  *   - writes the report to OUT_FILE via require('fs') when the shell allows
  *     file access, otherwise prints the whole HTML document to the console
  *
@@ -215,14 +221,19 @@
     for (const dbName of dbNames) {
       let collNames = [];
       try {
-        // mongosh's getCollectionInfos helper exposes no maxTimeMS (its signature is
-        // (filter, nameOnly, authorizedCollections, options) - nameOnly is a boolean,
-        // not an options bag). Using the raw listCollections command instead would let
-        // us pass maxTimeMS, but that command returns a cursor document, and reading
-        // only cursor.firstBatch would silently truncate on a database with more
-        // collections than fit in one batch - missing collections here mean missing
-        // indexes and wrong "unused" verdicts, which is worse than a rare stall on a
-        // metadata call. The per-database try/catch below is what bounds that risk.
+        // R10, empirically verified against a real mongod (v8.0.21, see CLAUDE.md
+        // "The documented maxTimeMS exception"): getCollectionInfos's signature DOES
+        // end in an options-shaped 4th argument that accepts { maxTimeMS } without
+        // throwing, but it is NOT forwarded/enforced server-side - confirmed by
+        // driving it against the maxTimeAlwaysTimeOut failpoint (which does throw
+        // MaxTimeMSExpired for a raw listCollections + maxTimeMS call) and observing
+        // it return normally regardless. Using the raw listCollections command
+        // instead would let maxTimeMS actually work, but that command returns a
+        // cursor document, and reading only cursor.firstBatch would silently
+        // truncate on a database with more collections than fit in one batch -
+        // missing collections here mean missing indexes and wrong "unused" verdicts,
+        // which is worse than a rare, unbounded stall on a metadata call. The
+        // per-database try/catch below is what bounds that risk instead.
         collNames = conn.getDB(dbName)
           .getCollectionInfos({ type: 'collection' }, true)
           .map((c) => c.name).filter((n) => !n.startsWith('system.')).sort();
@@ -259,10 +270,12 @@
             e.ops += Number(st.accesses.ops);
             if (st.accesses.since < e.since) e.since = st.accesses.since;
           }
-          // Same trade-off as getCollectionInfos above: mongosh's getIndexes helper
-          // takes no maxTimeMS, and the raw listIndexes command's cursor.firstBatch
-          // would silently truncate a collection with many indexes. The per-collection
-          // try/catch below is what bounds the damage of a stall here, not maxTimeMS.
+          // Same R10 trade-off as getCollectionInfos above, same empirical result:
+          // getIndexes({ maxTimeMS }) does not throw, but does not enforce the
+          // timeout either (verified against the maxTimeAlwaysTimeOut failpoint).
+          // The raw listIndexes command's cursor.firstBatch would silently truncate
+          // a collection with many indexes. The per-collection try/catch below is
+          // what bounds the damage of a stall here, not maxTimeMS.
           entry.indexes = coll.getIndexes();
         } catch (e) {
           entry.error = e.codeName ?? e.message;
@@ -1213,12 +1226,17 @@
       if (i.verdict !== 'drop' && i.verdict !== 'likely-drop') return;
       (byNs[i.ns] = byNs[i.ns] || []).push(i.name);
     });
+    // Must-fix minor (final review): bare `"` quoting let a namespace or
+    // index name containing a `"` produce a broken - and potentially
+    // injectable - statement that a human pastes straight into a production
+    // shell. JSON.stringify each name instead, so any embedded quote,
+    // backslash, or control character is escaped correctly.
     return Object.keys(byNs).sort().map(function (ns) {
       var dbName = ns.split('.')[0];
       var collName = ns.split('.').slice(1).join('.');
-      var names = byNs[ns].map(function (n) { return '"' + n + '"'; }).join(',');
-      return 'db.getSiblingDB("' + dbName + '").getCollection("' + collName
-        + '").dropIndexes([' + names + '])';
+      var names = byNs[ns].map(function (n) { return JSON.stringify(n); }).join(',');
+      return 'db.getSiblingDB(' + JSON.stringify(dbName) + ').getCollection(' + JSON.stringify(collName)
+        + ').dropIndexes([' + names + '])';
     }).join('\n');
   }
 

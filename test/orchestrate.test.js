@@ -45,15 +45,27 @@ test('selectCollectionTargets falls back to the full list when the seed host mat
   assert.deepEqual(selectCollectionTargets(members, 'unmatched-synthetic', false), members);
 });
 
+// FINDING 6 (final review, important): assert maxTimeMS on every server call
+// these fakes stand in for, so a future edit dropping it is caught here, not
+// only by the end-to-end suite against a real cluster.
 function sampleConn(docs, validator) {
   return {
     host: 'h1:27017',
     getDB: () => ({
-      getCollectionInfos: () => [{ name: 'orders', options: validator ? { validator } : {} }],
+      getCollectionInfos: (filter) => {
+        assert.deepEqual(filter, { name: 'orders' });
+        return [{ name: 'orders', options: validator ? { validator } : {} }];
+      },
       getCollection: () => ({
-        aggregate: (pipeline) => {
-          if (pipeline[0].$sample) return { toArray: () => docs };
-          if (pipeline[0].$listCatalog) return { toArray: () => [] };
+        aggregate: (pipeline, options) => {
+          if (pipeline[0].$sample) {
+            assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$sample must carry maxTimeMS');
+            return { toArray: () => docs };
+          }
+          if (pipeline[0].$listCatalog) {
+            assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$listCatalog must carry maxTimeMS');
+            return { toArray: () => [] };
+          }
           throw new Error('unexpected pipeline');
         },
       }),
@@ -90,9 +102,13 @@ function catalogConn(docs, multikeyPathsPerIndex) {
     getDB: () => ({
       getCollectionInfos: () => [{ name: 'orders', options: {} }],
       getCollection: () => ({
-        aggregate: (pipeline) => {
-          if (pipeline[0].$sample) return { toArray: () => docs };
+        aggregate: (pipeline, options) => {
+          if (pipeline[0].$sample) {
+            assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$sample must carry maxTimeMS');
+            return { toArray: () => docs };
+          }
           if (pipeline[0].$listCatalog) {
+            assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$listCatalog must carry maxTimeMS');
             return { toArray: () => [{ md: { indexes: multikeyPathsPerIndex.map(
               (multikeyPaths) => ({ multikeyPaths })) } }] };
           }
@@ -176,7 +192,10 @@ test('emit falls back to printing when the write throws', () => {
 const { deriveSeedHost } = require('../indexStats.js');
 
 test('deriveSeedHost prefers hello.me (replSetGetConfig-compatible host:port)', () => {
-  const adminDb = { runCommand: () => ({ me: 'h1.example.com:27017' }) };
+  const adminDb = { runCommand: (cmd) => {
+    assert.equal(cmd.maxTimeMS, 30000, 'hello must carry maxTimeMS');
+    return { me: 'h1.example.com:27017' };
+  } };
   const dbHandle = { serverStatus: () => { throw new Error('should not be called'); } };
   const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
   assert.deepEqual(r, { host: 'h1.example.com:27017', synthetic: false });
@@ -184,7 +203,10 @@ test('deriveSeedHost prefers hello.me (replSetGetConfig-compatible host:port)', 
 
 test('deriveSeedHost falls back to serverStatus().host when hello has no me (verified real output)', () => {
   const adminDb = { runCommand: () => ({}) };
-  const dbHandle = { serverStatus: () => ({ host: 'M-CJ7P325Q7J:27099' }) };
+  const dbHandle = { serverStatus: (options) => {
+    assert.equal(options && options.maxTimeMS, 30000, 'serverStatus must carry maxTimeMS');
+    return { host: 'M-CJ7P325Q7J:27099' };
+  } };
   const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
   assert.deepEqual(r, { host: 'M-CJ7P325Q7J:27099', synthetic: false });
 });

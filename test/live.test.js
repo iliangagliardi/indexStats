@@ -84,11 +84,20 @@ test('probeCapabilities reports an invalid URI_TEMPLATE distinctly, without ever
   assert.equal(caps.connectionBlockedReason, 'template-invalid');
 });
 
+// FINDING 6 (final review, important): the project's headline invariant -
+// "every server call carries maxTimeMS" - was asserted by no test, because
+// every fake below ignored the options/command argument entirely. A future
+// edit that dropped maxTimeMS from a real call would have been invisible.
+// These fakes now assert it on every command they stand in for.
 function fakeAdmin(rsConfig, helloMsg) {
   return {
     runCommand(cmd) {
-      if (cmd.hello) return helloMsg ? { msg: helloMsg } : { ok: 1 };
+      if (cmd.hello) {
+        assert.equal(cmd.maxTimeMS, CONFIG.MAX_TIME_MS, 'hello must carry maxTimeMS');
+        return helloMsg ? { msg: helloMsg } : { ok: 1 };
+      }
       if (cmd.replSetGetConfig) {
+        assert.equal(cmd.maxTimeMS, CONFIG.MAX_TIME_MS, 'replSetGetConfig must carry maxTimeMS');
         if (!rsConfig) {
           const e = new Error('not running with --replSet');
           e.codeName = 'NoReplicationEnabled';
@@ -182,8 +191,9 @@ test('an Unauthorized error from replSetGetConfig throws, not a silent single-no
 
 function fakeConn() {
   const coll = () => ({
-    aggregate(pipeline) {
+    aggregate(pipeline, options) {
       if (pipeline[0].$collStats) {
+        assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$collStats must carry maxTimeMS');
         return { toArray: () => [{ storageStats: {
           indexSizes: { _id_: 100, a_1: 200 },
           indexDetails: {
@@ -195,6 +205,7 @@ function fakeConn() {
         } }] };
       }
       if (pipeline[0].$indexStats) {
+        assert.equal(options && options.maxTimeMS, CONFIG.MAX_TIME_MS, '$indexStats must carry maxTimeMS');
         return { toArray: () => [
           { name: '_id_', accesses: { ops: 5, since: new Date('2026-01-01') } },
           { name: 'a_1', accesses: { ops: 0, since: new Date('2026-01-01') } },
@@ -202,24 +213,61 @@ function fakeConn() {
       }
       throw new Error('unexpected pipeline');
     },
+    // R10/finding 6: getIndexes() carries no maxTimeMS - see the code comment
+    // at its call site, empirically verified against a real mongod. Nothing
+    // to assert here; this is the documented exception, not an oversight.
     getIndexes: () => [{ v: 2, name: '_id_', key: { _id: 1 } }, { v: 2, name: 'a_1', key: { a: 1 } }],
   });
   return {
     host: 'h1:27017',
     setReadPref() { this.readPref = 'set'; },
     getDB: (name) => ({
-      getCollectionInfos: () => [{ name: 'orders', type: 'collection' },
-                                 { name: 'system.profile', type: 'collection' }],
+      // R10/finding 6: getCollectionInfos also carries no working maxTimeMS -
+      // same documented exception - but its OTHER two arguments are load-bearing
+      // (Task 11 regression: conn.adminCommand doesn't exist; a prior bug called
+      // getCollectionInfos with the wrong nameOnly shape). Assert the real call
+      // shape instead: ({ type: 'collection' }, true) - a boolean nameOnly, not
+      // an options bag.
+      getCollectionInfos: (filter, nameOnly) => {
+        assert.deepEqual(filter, { type: 'collection' });
+        assert.equal(nameOnly, true, 'nameOnly must be passed as a boolean, not an options bag');
+        return [{ name: 'orders', type: 'collection' },
+                { name: 'system.profile', type: 'collection' }];
+      },
       getCollection: coll,
       // Real mongosh Mongo connection objects expose adminCommand only on the
       // Database returned by getDB(), never on the connection itself - this
       // mock must mirror that shape or it will hide the bug it once hid.
-      adminCommand: (cmd) => (cmd.listDatabases
-        ? { databases: [{ name: 'shop' }, { name: 'admin' }, { name: 'local' }, { name: 'config' }] }
-        : { ok: 1 }),
+      adminCommand: (cmd) => {
+        if (cmd.listDatabases) {
+          assert.equal(cmd.maxTimeMS, CONFIG.MAX_TIME_MS, 'listDatabases must carry maxTimeMS');
+          return { databases: [{ name: 'shop' }, { name: 'admin' }, { name: 'local' }, { name: 'config' }] };
+        }
+        return { ok: 1 };
+      },
     }),
   };
 }
+
+// Must-fix minor (final review, finding 6): a dedicated test for the exact
+// getCollectionInfos({type:'collection'}, true) boolean-nameOnly call shape -
+// a prior real bug (Task 11) passed the wrong shape here and was only ever
+// caught end-to-end, never by a unit test.
+test('collectFromNode calls getCollectionInfos with a boolean nameOnly, not an options bag', () => {
+  let seenArgs = null;
+  const conn = fakeConn();
+  const realGetDB = conn.getDB;
+  conn.getDB = (name) => {
+    const dbHandle = realGetDB(name);
+    const realGCI = dbHandle.getCollectionInfos;
+    dbHandle.getCollectionInfos = (...args) => { seenArgs = args; return realGCI(...args); };
+    return dbHandle;
+  };
+  collectFromNode(conn, CONFIG);
+  assert.deepEqual(seenArgs[0], { type: 'collection' });
+  assert.equal(seenArgs[1], true);
+  assert.equal(typeof seenArgs[1], 'boolean', 'nameOnly must be a boolean, not an options object');
+});
 
 test('collects indexes, usage and storage for non-system collections only', () => {
   const r = collectFromNode(fakeConn(), CONFIG);

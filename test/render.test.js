@@ -173,6 +173,20 @@ test('dropCommandsFor emits one runnable statement per namespace', () => {
   assert.match(cmds, /getSiblingDB\("crm"\)\.getCollection\("contacts"\)\.dropIndexes\(\["c_1"\]\)/);
 });
 
+// Must-fix minor (final review): bare `"` + string-concat quoting let a
+// namespace or index name containing a `"` produce a broken, potentially
+// injectable statement pasted straight into a production shell.
+test('dropCommandsFor JSON-escapes names containing quotes and backslashes', () => {
+  const cmds = dropCommandsFor([
+    ix({ ns: 'shop.orders', name: 'weird"index\\name', verdict: 'drop' }),
+  ]);
+  // Must round-trip through JSON.parse (i.e. be a validly-escaped string
+  // literal), not just "contain" the raw characters via naive concatenation.
+  const match = cmds.match(/dropIndexes\((\[.*\])\)/);
+  assert.ok(match, 'expected a dropIndexes([...]) statement');
+  assert.deepEqual(JSON.parse(match[1]), ['weird"index\\name']);
+});
+
 test('dropCommandsFor never emits commands for non-candidates', () => {
   const cmds = dropCommandsFor([ix({ verdict: 'keep' }), ix({ verdict: 'inconclusive' }),
                                 ix({ verdict: 'mismatched' }), ix({ verdict: 'review' })]);

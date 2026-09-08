@@ -106,14 +106,24 @@ collects from members must match the *actual* target host against `config.SEED_H
 grab `discovered.members[0]`, or a single-connection run silently mislabels itself as whichever
 member happens to sort first in `rs.conf()`.)
 
-## The documented `maxTimeMS` exception
+## The documented `maxTimeMS` exception (R10, empirically verified against a real mongod)
 
 **Every server call carries `maxTimeMS`** so one stalled node cannot hang the run - except two,
-deliberately: mongosh's `getCollectionInfos`/`getIndexes` helpers accept no `maxTimeMS` argument
-at all. The raw `listCollections`/`listIndexes` commands do accept it, but they return a cursor
-document, and reading only `cursor.firstBatch` would silently truncate a database with many
-collections or a collection with many indexes - missing collections mean missing indexes and
-wrong "unused" verdicts, which is worse than a rare stall on a metadata call. The per-database and
+deliberately: mongosh's `getCollectionInfos`/`getIndexes` helpers. Their signatures DO end in an
+`options`-shaped argument (`getCollectionInfos(filter, nameOnly, authorizedCollections, options)`,
+`getIndexes(options)`) that syntactically accepts `{ maxTimeMS }` without throwing - but passing it
+does **not** enforce a timeout. Verified 2026-09-08 against a real standalone `mongod` (v8.0.21,
+started with `--setParameter enableTestCommands=1`) using the `maxTimeAlwaysTimeOut` failpoint
+(confirmed working first, against a raw `listCollections`/`maxTimeMS` command, which threw
+`MaxTimeMSExpired` as expected): with the same failpoint active,
+`getCollectionInfos({}, true, false, { maxTimeMS: 5000 })` and `getIndexes({ maxTimeMS: 5000 })`
+both returned normally - the option is accepted but silently dropped before it reaches the server.
+So the risk is real, just not a plain "throws TypeError" incompatibility: a stalled metadata call
+here can hang past `MAX_TIME_MS` with no way to bound it via this argument. The raw
+`listCollections`/`listIndexes` commands do enforce `maxTimeMS`, but they return a cursor document,
+and reading only `cursor.firstBatch` would silently truncate a database with many collections or a
+collection with many indexes - missing collections mean missing indexes and wrong "unused"
+verdicts, which is worse than a rare, unbounded stall on a metadata call. The per-database and
 per-collection `try`/`catch` around these calls is what bounds the damage instead of `maxTimeMS`.
 Keep this exception; do not "fix" it by switching to the raw commands.
 

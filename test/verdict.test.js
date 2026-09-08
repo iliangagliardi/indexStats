@@ -85,6 +85,30 @@ test('a suspect field never overrides observed usage', () => {
   assert.equal(v.flags.includes('suspect-field'), true);
 });
 
+// Must-fix minor (final review): no verdict-level test previously covered
+// the `not-in-validator && provable === true` half of the suspect-field
+// condition - one of only two conditions (with 'absent') that escalate a
+// verdict to 'drop'.
+test('a provable not-in-validator field turns likely-drop into drop', () => {
+  const v = deriveVerdict(idx({
+    schema: { checks: [{ field: 'legacyFlag', issue: 'not-in-validator', provable: true,
+      text: 'not declared in the collection validator, which forbids additional properties' }] },
+  }), CTX);
+  assert.equal(v.verdict, 'drop');
+  assert.equal(v.flags.includes('suspect-field'), true);
+});
+
+// The non-provable half must NOT escalate (already implied elsewhere, but
+// pins the boundary explicitly next to the provable case above).
+test('a non-provable not-in-validator field alone is not a suspect field', () => {
+  const v = deriveVerdict(idx({
+    schema: { checks: [{ field: 'legacyFlag', issue: 'not-in-validator', provable: false,
+      text: 'not declared in the collection validator (which permits additional properties, so this is advisory)' }] },
+  }), CTX);
+  assert.equal(v.flags.includes('suspect-field'), false);
+  assert.equal(v.verdict, 'likely-drop');
+});
+
 test('low-presence alone is not a suspect field', () => {
   const v = deriveVerdict(idx({ schema: { checks: [{ field: 'a', issue: 'low-presence', provable: false }] } }), CTX);
   assert.equal(v.flags.includes('suspect-field'), false);
