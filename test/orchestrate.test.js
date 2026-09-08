@@ -205,10 +205,10 @@ test('deriveSeedHost falls back to serverStatus().host when hello has no me (ver
   const adminDb = { runCommand: () => ({}) };
   const dbHandle = { serverStatus: (options) => {
     assert.equal(options && options.maxTimeMS, 30000, 'serverStatus must carry maxTimeMS');
-    return { host: 'M-CJ7P325Q7J:27099' };
+    return { host: 'mongo-01:27017' };
   } };
   const r = deriveSeedHost(adminDb, dbHandle, { MAX_TIME_MS: 30000 });
-  assert.deepEqual(r, { host: 'M-CJ7P325Q7J:27099', synthetic: false });
+  assert.deepEqual(r, { host: 'mongo-01:27017', synthetic: false });
 });
 
 test('deriveSeedHost falls through a privilege error to the next source rather than aborting', () => {

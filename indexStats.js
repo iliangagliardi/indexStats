@@ -119,8 +119,8 @@
   // than aborting the run:
   //   1. hello.me - set on replica-set members, and it is exactly the
   //      host:port form replSetGetConfig uses, so identities match.
-  //   2. serverStatus().host - verified on this machine to return
-  //      "M-CJ7P325Q7J:27099".
+  //   2. serverStatus().host - verified against a real mongod to return the
+  //      server's own host:port, e.g. "mongo-01:27017".
   //   3. only as a last resort, a clearly-synthetic literal - callers must
   //      treat `synthetic: true` as a signal to warn the user to set
   //      SEED_HOST manually before pasting peer payloads, or the merge will
