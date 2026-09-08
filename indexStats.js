@@ -551,6 +551,30 @@
     return out;
   }
 
+  // Pure boundary parser for PEER_PAYLOADS. Entries are documented as raw JSON
+  // text pasted from another shell's PEER_PAYLOAD_BEGIN/END block, but someone
+  // hand-editing the array literal could just as easily paste an already-
+  // parsed object literal instead - accept either. (Verified bug, Task 11:
+  // main() used to hand PEER_PAYLOADS straight to mergePeerPayloads without
+  // parsing at all, which crashed on the first real paste-in with a bare
+  // "Cannot read properties of undefined" - JSON.parse alone would only trade
+  // that for an unhelpful "Unexpected token" with no clue which entry was
+  // bad.) Throws a clear error naming the offending entry's index so a
+  // hand-edited array is easy to fix.
+  function parsePeerPayloads(entries) {
+    return (entries ?? []).map((entry, i) => {
+      if (entry !== null && typeof entry === 'object') return entry;
+      if (typeof entry === 'string') {
+        try {
+          return JSON.parse(entry);
+        } catch (e) {
+          throw new Error(`PEER_PAYLOADS[${i}] is not valid JSON: ${e.message}`);
+        }
+      }
+      throw new Error(`PEER_PAYLOADS[${i}] must be a JSON string or a parsed object, got ${typeof entry}`);
+    });
+  }
+
   // --------------------------------------------------------------------------
   // Schema and index consistency checks
   // --------------------------------------------------------------------------
@@ -682,6 +706,25 @@
   // Sampling, orchestration and output
   // --------------------------------------------------------------------------
 
+  // Pure selection of which members main()'s collection loop should target.
+  // When fanning out (this shell can open its own connections to a
+  // multi-node replica set), every discovered member is a target. Otherwise
+  // there is exactly one real connection available - the one this shell is
+  // already on - and it must be attributed to the member matching seedHost,
+  // never to whichever member happens to sort first in the discovered list.
+  // (Verified bug, Task 11: the degraded/single-connection loop used to
+  // iterate discovered members in rs.config order and `break` after the
+  // first, so a run on a real secondary silently mislabelled its one
+  // reachable connection as a different, sometimes genuinely-unreachable,
+  // member.) Falls back to the full member list only when seedHost couldn't
+  // be matched to any configured member at all (the synthetic/unidentified
+  // seed case, flagged to the user separately).
+  function selectCollectionTargets(members, seedHost, fanOut) {
+    if (fanOut) return members;
+    const seedMatches = members.filter((m) => m.host === seedHost);
+    return seedMatches.length ? seedMatches : members;
+  }
+
   // Prefers a reachable hidden member for document sampling (spares the
   // primary), then a reachable secondary, then a reachable primary, then any
   // reachable member. Returns null when nothing is reachable.
@@ -806,12 +849,8 @@
     // script is actually running on. Running this exact degraded path directly on a
     // secondary (127.0.0.1:27022) produced a payload claiming host 127.0.0.1:27021 -
     // a different, potentially genuinely-unreachable member - was the one reachable.
-    // Restrict the single-connection case to the member matching the seed host we
-    // already derived (deriveSeedHost/hello().me), falling back to the full list only
-    // when that seed couldn't be matched to a configured member at all (e.g. the
-    // synthetic/unidentified-seed case, already flagged to the user separately).
-    const seedMatches = discovered.members.filter((m) => m.host === config.SEED_HOST);
-    const targets = fanOut ? discovered.members : (seedMatches.length ? seedMatches : discovered.members);
+    // Fixed by extracting the selection into the pure, tested selectCollectionTargets.
+    const targets = selectCollectionTargets(discovered.members, config.SEED_HOST, fanOut);
 
     const nodeResults = [];
     for (const member of targets) {
@@ -863,9 +902,9 @@
     // "paste each payload below into PEER_PAYLOADS" message below), but mergePeerPayloads
     // expects parsed objects (that's what every unit test in peer.test.js hands it) -
     // passing the raw strings straight through crashed with "Cannot read properties of
-    // undefined (reading 'filter')" on the very first real paste-in. Parse here, once,
-    // at the boundary between the pasted-in raw config and the pure merge function.
-    const withPeers = mergePeerPayloads(merged, PEER_PAYLOADS.map((p) => JSON.parse(p)));
+    // undefined (reading 'filter')" on the very first real paste-in. Fixed by extracting
+    // the boundary parse into the pure, tested parsePeerPayloads.
+    const withPeers = mergePeerPayloads(merged, parsePeerPayloads(PEER_PAYLOADS));
     const payload = applyAnalysis(withPeers, config, samples);
     const s = summarise(payload.indexes);
 
@@ -1279,7 +1318,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

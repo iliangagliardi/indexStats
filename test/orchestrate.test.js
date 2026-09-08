@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { pickSampleMember, sampleNamespace, emit } = require('../indexStats.js');
+const { pickSampleMember, sampleNamespace, emit, selectCollectionTargets } = require('../indexStats.js');
 
 const CONFIG = { SAMPLE_SIZE: 100, MAX_TIME_MS: 30000, OUT_FILE: 'indexStats-report.html' };
 
@@ -25,6 +25,24 @@ test('falls back to a secondary, then to the primary', () => {
 
 test('never picks an unreachable member, and returns null when none are reachable', () => {
   assert.equal(pickSampleMember([{ host: 'h1', role: 'primary', hidden: true, reachable: false }]), null);
+});
+
+test('selectCollectionTargets returns every member when fanning out', () => {
+  const members = [{ host: 'h1' }, { host: 'h2' }, { host: 'h3' }];
+  assert.deepEqual(selectCollectionTargets(members, 'h2', true), members);
+});
+
+// Task 11 regression: the seed host is deliberately NOT the first member in
+// the list below, so this test can only pass if selection actually filters
+// by seedHost instead of grabbing members[0] (the original bug).
+test('selectCollectionTargets picks only the seed host when not fanning out', () => {
+  const members = [{ host: 'h1' }, { host: 'h2' }, { host: 'h3' }];
+  assert.deepEqual(selectCollectionTargets(members, 'h2', false), [{ host: 'h2' }]);
+});
+
+test('selectCollectionTargets falls back to the full list when the seed host matches nothing (synthetic seed)', () => {
+  const members = [{ host: 'h1' }, { host: 'h2' }];
+  assert.deepEqual(selectCollectionTargets(members, 'unmatched-synthetic', false), members);
 });
 
 function sampleConn(docs, validator) {

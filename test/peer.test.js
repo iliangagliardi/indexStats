@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mergePeerPayloads, applyAnalysis } = require('../indexStats.js');
+const { mergePeerPayloads, applyAnalysis, parsePeerPayloads } = require('../indexStats.js');
 
 const CONFIG = { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 };
 
@@ -158,4 +158,35 @@ test('gaps.skipped is deduped by {member, ns, reason}', () => {
 
   const merged = mergePeerPayloads(local, [peerB]);
   assert.equal(merged.gaps.skipped.length, 1);
+});
+
+// Task 11 regression: PEER_PAYLOADS entries were never JSON.parse'd before
+// reaching mergePeerPayloads, crashing on the first real paste-in.
+test('parsePeerPayloads parses raw JSON string entries', () => {
+  const parsed = parsePeerPayloads(['{"a":1}', '{"b":2}']);
+  assert.deepEqual(parsed, [{ a: 1 }, { b: 2 }]);
+});
+
+test('parsePeerPayloads accepts entries that are already parsed objects', () => {
+  const parsed = parsePeerPayloads([{ a: 1 }, '{"b":2}']);
+  assert.deepEqual(parsed, [{ a: 1 }, { b: 2 }]);
+});
+
+test('parsePeerPayloads returns an empty array for empty/undefined input', () => {
+  assert.deepEqual(parsePeerPayloads([]), []);
+  assert.deepEqual(parsePeerPayloads(undefined), []);
+});
+
+test('parsePeerPayloads throws a clear error naming the offending index for invalid JSON', () => {
+  assert.throws(
+    () => parsePeerPayloads(['{"a":1}', '{not valid json']),
+    /PEER_PAYLOADS\[1\]/,
+  );
+});
+
+test('parsePeerPayloads throws a clear error naming the offending index for a non-string/object entry', () => {
+  assert.throws(
+    () => parsePeerPayloads([{ a: 1 }, 42]),
+    /PEER_PAYLOADS\[1\]/,
+  );
 });
