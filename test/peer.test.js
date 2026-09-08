@@ -162,6 +162,74 @@ test('gaps.skipped is deduped by {member, ns, reason}', () => {
 
 // Task 11 regression: PEER_PAYLOADS entries were never JSON.parse'd before
 // reaching mergePeerPayloads, crashing on the first real paste-in.
+// FINDING 2 (final review): the two merge paths used to disagree about
+// missingOn - mergeNodes excludes a member that errored/was never observed
+// for this namespace, mergePeerPayloads used to include it, forcing a
+// misleading 'mismatched' verdict instead of finding 1's 'inconclusive'.
+// Reproduce the same "one member errored on this collection" cluster state
+// through BOTH paths and assert they now agree.
+test('finding 2: a peer-merged payload with an errored member agrees with the direct mergeNodes payload (inconclusive, not mismatched)', () => {
+  const CONFIG = { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 };
+  const members = ['h1', 'h2'];
+
+  // h1's own run: reaches only itself, h2 unreachable-placeholder.
+  const local = {
+    meta: { mode: 'single-node', replicaSetName: 'rs0' },
+    members: [
+      { id: 0, host: 'h1', role: 'primary', hidden: false, delaySecs: 0, votes: 1, reachable: true, error: null },
+      { id: 1, host: 'h2', role: 'unknown', hidden: false, delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' },
+    ],
+    gaps: { unreachableMembers: [{ host: 'h2', error: 'connection refused' }], skipped: [] },
+    namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1'], hasValidator: false, sample: null }],
+    indexes: [{
+      ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
+      perNode: [{ host: 'h1', present: true, ops: 0, since: null, counterAgeDays: 300,
+                  sizeBytes: 500, reusableBytes: 0, cacheBytes: 0, error: null }],
+      maxOps: 0, minCounterAgeDays: 300, clusterSizeBytes: 500, perMemberSizeBytes: 500,
+      redundancy: { class: null, coveredBy: null },
+      definition: { consistent: true, missingOn: [], variants: [{ key: { a: 1 }, hosts: ['h1'] }] },
+      schema: { checks: [] },
+    }],
+  };
+
+  // h2's own run: reaches only itself, and its ONE collection errored -
+  // exactly like mergeNodes would produce (perNode present:false + error,
+  // excluded from missingOn, per the finding-1 fix in mergeNodes above).
+  const peer = {
+    meta: { mode: 'single-node', replicaSetName: 'rs0' },
+    members: [
+      { id: 1, host: 'h2', role: 'primary', hidden: false, delaySecs: 0, votes: 1, reachable: true, error: null },
+      { id: 0, host: 'h1', role: 'unknown', hidden: false, delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' },
+    ],
+    gaps: {
+      unreachableMembers: [{ host: 'h1', error: 'connection refused' }],
+      skipped: [{ member: 'h2', ns: 'shop.orders', reason: 'MaxTimeMSExpired' }],
+    },
+    namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h2'], hasValidator: false, sample: null }],
+    indexes: [{
+      ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
+      perNode: [{ host: 'h2', present: false, ops: null, since: null, counterAgeDays: null,
+                  sizeBytes: 0, reusableBytes: 0, cacheBytes: 0, error: 'MaxTimeMSExpired' }],
+      maxOps: 0, minCounterAgeDays: null, clusterSizeBytes: 0, perMemberSizeBytes: 0,
+      redundancy: { class: null, coveredBy: null },
+      definition: { consistent: true, missingOn: [], variants: [] },
+      schema: { checks: [] },
+    }],
+  };
+
+  const merged = mergePeerPayloads(local, [peer]);
+  const idx = merged.indexes[0];
+  // missingOn must exclude h2 - it errored, it was not "confirmed absent".
+  assert.deepEqual(idx.definition.missingOn, []);
+  assert.equal(idx.definition.consistent, true);
+
+  const analysed = applyAnalysis(merged, CONFIG, []);
+  assert.equal(analysed.indexes[0].verdict, 'inconclusive');
+  assert.notEqual(analysed.indexes[0].verdict, 'mismatched');
+  assert.match(analysed.indexes[0].reasons.join(' '), /h2/);
+  assert.match(analysed.indexes[0].reasons.join(' '), /MaxTimeMSExpired/);
+});
+
 test('parsePeerPayloads parses raw JSON string entries', () => {
   const parsed = parsePeerPayloads(['{"a":1}', '{"b":2}']);
   assert.deepEqual(parsed, [{ a: 1 }, { b: 2 }]);

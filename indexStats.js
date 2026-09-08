@@ -363,9 +363,20 @@
           const spec = idxList.find((s) => s.name === name);
           if (!coll || !spec) {
             if (coll && !coll.error) missingOn.push(m.host);
+            // When `coll` is entirely absent, the whole database was skipped for
+            // this member (e.g. Unauthorized) rather than the collection itself
+            // erroring - that reason lives in this node's own `skipped` list, not
+            // on a collections[ns] entry. Surface it on perNode too, so a
+            // downstream "unobserved" verdict (finding 1) can name why.
+            let observationError = coll?.error ?? null;
+            if (!coll) {
+              const dbName = ns.split('.')[0];
+              const skip = byHost.get(m.host)?.skipped.find((s) => s.ns === dbName);
+              if (skip) observationError = skip.reason;
+            }
             perNode.push({ host: m.host, present: false, ops: null, since: null,
                            counterAgeDays: null, sizeBytes: 0, reusableBytes: 0,
-                           cacheBytes: 0, error: coll?.error ?? null });
+                           cacheBytes: 0, error: observationError });
             continue;
           }
           firstSpec = firstSpec ?? spec;
@@ -535,8 +546,27 @@
       idx.minCounterAgeDays = ages.length ? Math.min(...ages) : null;
       idx.clusterSizeBytes = present.reduce((s, n) => s + Number(n.sizeBytes ?? 0), 0);
       idx.perMemberSizeBytes = present.length ? Math.round(idx.clusterSizeBytes / present.length) : 0;
+      // Same rule as mergeNodes' own missingOn (~365): a reachable member only
+      // counts as "missing this index" when it demonstrably finished checking
+      // this namespace without error - never when it simply was never observed
+      // (a whole-collection error, or a peer payload that never reached this ns
+      // at all). Without this exclusion this path used to treat "not present"
+      // and "never observed" identically, disagreeing with mergeNodes and
+      // forcing a misleading "mismatched / possible in-flight index build"
+      // verdict where the real story is "this member was never checked" -
+      // finding 1's coverage gate in deriveVerdict is what actually downgrades
+      // those to inconclusive, and it needs missingOn to NOT already claim them.
+      // gaps.skipped mixes two shapes (db-level skips store the db name in
+      // `ns`; collection-level errors store the full namespace) - match both.
+      const dbNameOfNs = idx.ns.split('.')[0];
+      const skippedThisNs = new Set(
+        out.gaps.skipped
+          .filter((s) => s.ns === idx.ns || s.ns === dbNameOfNs)
+          .map((s) => s.member));
       const missingOn = out.members
-        .filter((m) => m.reachable && !present.some((n) => n.host === m.host))
+        .filter((m) => m.reachable)
+        .filter((m) => !present.some((n) => n.host === m.host))
+        .filter((m) => !skippedThisNs.has(m.host))
         .map((m) => m.host);
       idx.definition = {
         ...idx.definition,
@@ -982,6 +1012,33 @@
       return { verdict: 'keep', flags, reasons };
     }
 
+    // FINDING 1 (critical, final review): a reachable member that produced NO
+    // observation for THIS index (a collection-level error, a per-database
+    // skip, or - in a merged peer payload - a namespace that peer's own run
+    // never reached at all) must block a droppable verdict exactly like an
+    // unreachable member does. Before this gate, `idx.definition.missingOn`
+    // deliberately excludes these hosts (that field means "confirmed genuinely
+    // absent", not "unknown"), so `definition.consistent` stayed true and a
+    // zero-ops verdict sailed straight through to likely-drop/drop while
+    // one member was silently never checked. Compute the gap directly from
+    // perNode presence, using missingOn only to recognise the (legitimate,
+    // separately-handled-by-the-mismatched-gate-above) "confirmed absent"
+    // case as NOT a coverage gap.
+    const presentHosts = new Set(idx.perNode.filter((n) => n.present).map((n) => n.host));
+    const confirmedAbsentHosts = new Set(idx.definition.missingOn ?? []);
+    const unobservedHosts = (ctx.reachableHosts ?? [])
+      .filter((h) => !presentHosts.has(h) && !confirmedAbsentHosts.has(h));
+    if (unobservedHosts.length) {
+      const detail = unobservedHosts.map((h) => {
+        const node = idx.perNode.find((n) => n.host === h);
+        return node && node.error ? `${h} (${node.error})` : h;
+      }).join(', ');
+      flags.push('unobserved-member');
+      reasons.unshift(`no observation for this index on ${detail} - a zero-operation `
+        + 'verdict cannot be confirmed there, so this index cannot be dropped yet');
+      return { verdict: 'inconclusive', flags, reasons };
+    }
+
     if (ctx.unreachableHosts.length) {
       reasons.unshift(`zero operations everywhere observed, but ${ctx.unreachableHosts.join(', ')} could not be reached - unused cannot be confirmed`);
       return { verdict: 'inconclusive', flags, reasons };
@@ -1005,6 +1062,7 @@
   function applyAnalysis(payload, config, samples) {
     const hiddenHosts = payload.members.filter((m) => m.hidden).map((m) => m.host);
     const unreachableHosts = payload.gaps.unreachableMembers.map((m) => m.host);
+    const reachableHosts = payload.members.filter((m) => m.reachable).map((m) => m.host);
     const sampleByNs = new Map((samples ?? []).map((s) => [s.ns, s]));
 
     for (const idx of payload.indexes) {
@@ -1016,7 +1074,7 @@
                 validator: sample.validator }, config)
           : [],
       };
-      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts }));
+      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts, reachableHosts }));
     }
 
     payload.indexes.sort((a, b) => {

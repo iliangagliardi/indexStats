@@ -1,7 +1,7 @@
 // test/merge.test.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mergeNodes } = require('../indexStats.js');
+const { mergeNodes, applyAnalysis } = require('../indexStats.js');
 
 const NOW = new Date('2026-09-07T00:00:00Z');
 const DAYS = (n) => new Date(NOW.getTime() - n * 86400000);
@@ -85,4 +85,49 @@ test('collection-level errors land in gaps.skipped', () => {
   broken.collections['shop.orders'] = { error: 'MaxTimeMSExpired', indexes: [], usage: {}, storage: {} };
   const p = mergeNodes({ members, nodeResults: [broken, node('h2')], samples: [], now: NOW });
   assert.deepEqual(p.gaps.skipped, [{ member: 'h1', ns: 'shop.orders', reason: 'MaxTimeMSExpired' }]);
+});
+
+// FINDING 1 (final review, critical): a collection-level error on ONE member
+// must NOT be conflated with "index confirmed absent there" (missingOn) - it
+// is "never observed", a different, more dangerous condition that end-to-end
+// (applyAnalysis) must downgrade a zero-ops verdict to inconclusive for, on
+// pain of recommending a drop for an index a member was simply never checked
+// against (the reviewer's own reproduction: a hidden analytics member timing
+// out on $collStats while every other member is old and unused).
+test('a collection-level error is excluded from missingOn but still present:false with the error carried on perNode', () => {
+  const broken = node('h1');
+  broken.collections['shop.orders'] = { error: 'MaxTimeMSExpired', indexes: [], usage: {}, storage: {} };
+  const p = mergeNodes({ members, nodeResults: [broken, node('h2')], samples: [], now: NOW });
+  const idx = p.indexes[0];
+  assert.equal(idx.definition.consistent, true, 'a collection error must not itself flip consistent to false');
+  assert.deepEqual(idx.definition.missingOn, []);
+  const h1Node = idx.perNode.find((n) => n.host === 'h1');
+  assert.equal(h1Node.present, false);
+  assert.equal(h1Node.error, 'MaxTimeMSExpired');
+});
+
+test('end-to-end: a collection-level error on one member downgrades an old, zero-ops, otherwise-droppable index to inconclusive, not drop', () => {
+  const broken = node('h1', { usage: { a_1: { ops: 0, since: DAYS(300) } } });
+  broken.collections['shop.orders'] = { error: 'MaxTimeMSExpired', indexes: [], usage: {}, storage: {} };
+  const other = node('h2', { usage: { a_1: { ops: 0, since: DAYS(300) } } });
+  const merged = mergeNodes({ members, nodeResults: [broken, other], samples: [], now: NOW });
+  const payload = applyAnalysis(merged, { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 }, []);
+  const idx = payload.indexes[0];
+  assert.notEqual(idx.verdict, 'drop');
+  assert.notEqual(idx.verdict, 'likely-drop');
+  assert.equal(idx.verdict, 'inconclusive');
+  assert.match(idx.reasons.join(' '), /h1/);
+  assert.match(idx.reasons.join(' '), /MaxTimeMSExpired/);
+});
+
+// Same defect via the per-database skip path (~183-186): the collection
+// never even gets an entry, so `coll` itself is undefined for that host.
+test('a per-database skip (Unauthorized) also carries its reason onto perNode and is excluded from missingOn', () => {
+  const skipped = { ...node('h1'), namespaces: [], collections: {}, skipped: [{ ns: 'shop', reason: 'Unauthorized' }] };
+  const p = mergeNodes({ members, nodeResults: [skipped, node('h2')], samples: [], now: NOW });
+  const idx = p.indexes[0];
+  assert.deepEqual(idx.definition.missingOn, []);
+  const h1Node = idx.perNode.find((n) => n.host === 'h1');
+  assert.equal(h1Node.present, false);
+  assert.equal(h1Node.error, 'Unauthorized');
 });

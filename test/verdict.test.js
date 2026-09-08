@@ -91,6 +91,52 @@ test('low-presence alone is not a suspect field', () => {
   assert.equal(v.verdict, 'likely-drop');
 });
 
+// FINDING 1 (final review, critical): a reachable member that produced no
+// observation for an index (collection-level error, e.g. MaxTimeMSExpired on
+// a large collection) must block a droppable verdict exactly like an
+// unreachable member does - even though `definition.missingOn` deliberately
+// excludes it (that field means "confirmed genuinely absent", not "unknown").
+test('a reachable member with a collection-level error blocks a drop even though missingOn excludes it', () => {
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const v = deriveVerdict(idx({
+    perNode: [
+      { host: 'h1', present: true, ops: 0 },
+      { host: 'h2', present: false, ops: null, error: 'MaxTimeMSExpired' },
+    ],
+    definition: { consistent: true, missingOn: [], variants: [] },
+  }), ctx);
+  assert.equal(v.verdict, 'inconclusive');
+  assert.equal(v.flags.includes('unobserved-member'), true);
+  assert.match(v.reasons.join(' '), /h2/);
+  assert.match(v.reasons.join(' '), /MaxTimeMSExpired/);
+  // must not falsely claim zero ops everywhere was confirmed
+  assert.doesNotMatch(v.reasons.join(' '), /zero operations on every data-bearing member/);
+});
+
+// Same defect, reached via a per-database skip (Unauthorized) rather than a
+// per-collection error: the member never even produced a perNode entry.
+test('a reachable member entirely missing from perNode (never observed) blocks a drop', () => {
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const v = deriveVerdict(idx({
+    perNode: [{ host: 'h1', present: true, ops: 0 }],
+    definition: { consistent: true, missingOn: [], variants: [] },
+  }), ctx);
+  assert.equal(v.verdict, 'inconclusive');
+  assert.match(v.reasons.join(' '), /h2/);
+});
+
+// A genuinely confirmed-absent member (real schema drift, present in
+// missingOn) must still take the mismatched path, not be swept into the new
+// coverage gate.
+test('a confirmed-missing member (in definition.missingOn) is still mismatched, not inconclusive-by-coverage', () => {
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const v = deriveVerdict(idx({
+    perNode: [{ host: 'h1', present: true, ops: 0 }],
+    definition: { consistent: false, missingOn: ['h2'], variants: [] },
+  }), ctx);
+  assert.equal(v.verdict, 'mismatched');
+});
+
 test('applyAnalysis ranks drop candidates first, then by cluster size', () => {
   const payload = {
     members: [{ host: 'h1', hidden: false, reachable: true }],
