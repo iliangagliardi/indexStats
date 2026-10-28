@@ -278,9 +278,20 @@ test('renderShardCoverage names every shard, how it was reached, and its coverag
 
 test('renderShardCoverage explains a partially covered shard in terms a reader can act on', () => {
   const html = renderShardCoverage(SHARDED_PAYLOAD);
+  // shardB is the indirect (mongos-routed) shard with readPref 'primary' -
+  // only the mode === 'indirect' branch can render this exact phrase, so it
+  // proves the per-shard readPref is actually rendered, not just mentioned
+  // via the static advisory note (which is what the bare /secondaryPreferred/
+  // match used to let through, since shardA's 'secondaryPreferred' is never
+  // printed for a direct shard).
   assert.match(html, /mongos/);
-  assert.match(html, /readPreference/);
+  assert.match(html, /readPreference primary/);
+});
+
+test('renderShardCoverage appends the actionable advisory note when any shard is partial', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
   assert.match(html, /secondaryPreferred/);
+  assert.match(html, /downgraded to inconclusive/);
 });
 
 test('renderShardCoverage renders nothing on a deployment with no shards', () => {
@@ -297,7 +308,12 @@ test('renderShardCoverage escapes shard names', () => {
 
 test('the sharded report embeds the shard coverage panel', () => {
   const html = renderHTML(SHARDED_PAYLOAD);
-  assert.match(html, /shardB/);
+  // Assert on markup only renderShardCoverage's panel emits, not on text
+  // that also appears in the verbatim JSON payload dump embedded elsewhere
+  // in the document (e.g. "shardB"), which would pass even if the
+  // ${renderShardCoverage(payload)} call were deleted from renderHTML.
+  assert.match(html, /shard coverage \(2\)/);
+  assert.match(html, /<th>coverage<\/th>/);
 });
 
 test('selectIndexes filters by shard', () => {

@@ -1858,12 +1858,19 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
     const shards = payload.shards ?? [];
     if (shards.length === 0) return '';
     const rows = shards.map((s) => {
+      // Shard records normally come from buildShardRecord(), which guarantees
+      // these arrays - but they can also arrive via mergePeerPayloads() from
+      // PEER_PAYLOADS, JSON a human pastes in by hand, where a truncated or
+      // hand-edited entry could omit either field. Fall back to [] so one bad
+      // pasted record can't throw and take down the whole report.
+      const observedHosts = s.observedHosts ?? [];
+      const expectedHosts = s.expectedHosts ?? [];
       const how = s.mode === 'indirect'
         ? `through mongos (readPreference ${esc(s.readPref)})`
         : 'direct connection to each member';
-      const seen = s.observedHosts.length
-        ? `${s.observedHosts.length} of ${s.expectedHosts.length} members: `
-          + s.observedHosts.map((h) => esc(h)).join(', ')
+      const seen = observedHosts.length
+        ? `${observedHosts.length} of ${expectedHosts.length} members: `
+          + observedHosts.map((h) => esc(h)).join(', ')
         : 'no members answered';
       const note = s.error ? ` - ${esc(s.error)}` : s.draining ? ' - draining' : '';
       return `<tr><td class="mono">${esc(s.name)}</td><td>${how}</td>`
