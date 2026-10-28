@@ -508,6 +508,41 @@
     return result;
   }
 
+  // Pure: fold "what we expected to see on this shard" and "what actually
+  // answered" into one coverage verdict. This is the safety gate for sharded
+  // clusters - an index can only be called unused on a shard whose every
+  // data-bearing member was observed, exactly as on a replica set.
+  //
+  // Three values, not two: 'none' (nothing answered) is kept distinct from
+  // 'partial' (some members answered) because the report has to explain the
+  // two differently. Both block a droppable verdict identically.
+  function buildShardRecord(shard, opts) {
+    const expectedHosts = opts.expectedHosts ?? [];
+    const observedHosts = opts.observedHosts ?? [];
+    let coverage;
+    if (observedHosts.length === 0) {
+      coverage = 'none';
+    } else if (opts.error || opts.unattributed || expectedHosts.length === 0
+               || !expectedHosts.every((h) => observedHosts.includes(h))) {
+      coverage = 'partial';
+    } else {
+      coverage = 'full';
+    }
+    return {
+      name: shard.name ?? null,
+      setName: shard.setName ?? null,
+      hosts: shard.hosts ?? [],
+      state: Number(shard.state ?? 1),
+      draining: Boolean(shard.draining),
+      mode: opts.mode,
+      coverage,
+      expectedHosts,
+      observedHosts,
+      readPref: opts.readPref ?? 'primary',
+      error: opts.error ?? null,
+    };
+  }
+
   // Pure: on a sharded cluster, $collStats and $indexStats run through a
   // mongos return one document per shard, each tagged with `shard` and the
   // `host` that answered. Split those tagged documents into the same
@@ -1683,7 +1718,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

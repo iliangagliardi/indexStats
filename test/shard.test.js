@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectTopology, parseShardHost, demuxShardStats } = require('../indexStats.js');
+const { detectTopology, parseShardHost, demuxShardStats, buildShardRecord } = require('../indexStats.js');
 
 test('detectTopology recognises a mongos by its isdbgrid marker', () => {
   assert.equal(detectTopology({ msg: 'isdbgrid', ok: 1 }), 'sharded');
@@ -167,4 +167,63 @@ test('demuxShardStats reports unattributed false when every document is tagged',
 
 test('demuxShardStats returns an empty result for empty input', () => {
   assert.deepEqual(demuxShardStats([], []), { byShard: {}, unattributed: false });
+});
+
+const SHARD_A = { name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017', 'h3:27017'], state: 1, draining: false };
+
+test('buildShardRecord reports full coverage when every expected member was observed', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'direct', expectedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+    observedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+    readPref: 'secondaryPreferred', error: null, unattributed: false });
+  assert.equal(rec.coverage, 'full');
+  assert.equal(rec.mode, 'direct');
+  assert.equal(rec.name, 'shardA');
+});
+
+test('buildShardRecord reports partial coverage when only some members answered', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'direct', expectedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+    observedHosts: ['h1:27017', 'h2:27017'],
+    readPref: 'secondaryPreferred', error: null, unattributed: false });
+  assert.equal(rec.coverage, 'partial');
+});
+
+test('buildShardRecord reports partial coverage for the Atlas case: one member via mongos', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+    observedHosts: ['h1:27017'], readPref: 'primary', error: null, unattributed: false });
+  assert.equal(rec.coverage, 'partial');
+  assert.equal(rec.mode, 'indirect');
+  assert.equal(rec.readPref, 'primary');
+});
+
+test('buildShardRecord reports no coverage when the shard answered nothing', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: ['h1:27017'], observedHosts: [],
+    readPref: 'primary', error: 'Unauthorized', unattributed: false });
+  assert.equal(rec.coverage, 'none');
+  assert.equal(rec.error, 'Unauthorized');
+});
+
+test('buildShardRecord never reports full coverage when a document arrived unattributed', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'],
+    readPref: 'primary', error: null, unattributed: true });
+  assert.equal(rec.coverage, 'partial');
+});
+
+test('buildShardRecord never reports full coverage when nothing was expected', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: [], observedHosts: [],
+    readPref: 'primary', error: null, unattributed: false });
+  assert.equal(rec.coverage, 'none');
+});
+
+test('buildShardRecord carries the implicit single shard of a non-sharded deployment', () => {
+  const rec = buildShardRecord({ name: null, setName: null, hosts: [], state: 1, draining: false }, {
+    mode: 'direct', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'],
+    readPref: 'secondaryPreferred', error: null, unattributed: false });
+  assert.equal(rec.name, null);
+  assert.equal(rec.coverage, 'full');
 });
