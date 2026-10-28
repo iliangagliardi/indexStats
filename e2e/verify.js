@@ -7,17 +7,30 @@
 const fs = require('fs');
 const assert = require('node:assert/strict');
 
-// Harness defect found in Task 12 against mongosh 2.13.0: `process.argv[2]` is
-// the CONNECTION STRING mongosh was launched with, not a script argument, so
-// the old `process.argv[2] ?? 'indexStats-report.html'` made every documented
-// invocation try to open "mongodb://127.0.0.1:27030" as a file and die with
-// ENOENT. Both overrides now come from the environment, which mongosh passes
-// through untouched; the argv scan is kept so the documented
-// `--expect-unreachable` flag still works wherever it does arrive.
-const env = (typeof process === 'object' && process.env) ? process.env : {};
-const file = env.INDEXSTATS_E2E_REPORT || 'indexStats-report.html';
+// This file is run under BOTH runtimes, and they disagree about argv:
+//   node   e2e/verify.js indexStats-report.html   -> argv[2] IS the report path
+//   mongosh "mongodb://..." --file e2e/verify.js  -> argv[2] is the CONNECTION STRING
+// Harness defect found in Task 12 against mongosh 2.13.0: the original
+// `process.argv[2] ?? 'indexStats-report.html'` took mongosh's connection
+// string as a filename and died with
+// `ENOENT: no such file or directory, open 'mongodb://127.0.0.1:27030'`.
+// Reading the path ONLY from the environment fixed mongosh but silently broke
+// the node form documented in INSTALLATION.md and RUNNING-ON-REPLICA-SETS.md:
+// its argument was ignored, so pointing it at a differently-named report
+// verified the DEFAULT file and still printed "ok" - a false pass, which is
+// worse than the crash it replaced.
+// So: honour argv[2] only when it cannot be a connection string and is not a
+// flag. Do not "simplify" this guard away; it is what makes one file correct
+// under two runtimes. Precedence is argument, then environment, then default.
+const proc = (typeof process === 'object' && process) ? process : {};
+const env = proc.env ?? {};
+const argv = proc.argv ?? [];
+const argPath = (typeof argv[2] === 'string' && argv[2].length > 0
+  && !/^mongodb(\+srv)?:\/\//.test(argv[2]) && !argv[2].startsWith('-'))
+  ? argv[2] : null;
+const file = argPath ?? env.INDEXSTATS_E2E_REPORT ?? 'indexStats-report.html';
 const expectUnreachable = env.INDEXSTATS_E2E_EXPECT === 'unreachable'
-  || process.argv.includes('--expect-unreachable');
+  || argv.includes('--expect-unreachable');
 const shardMode = env.INDEXSTATS_E2E_MODE === 'indirect' ? 'indirect' : 'direct';
 const html = fs.readFileSync(file, 'utf8');
 const m = html.match(/<script type="application\/json" id="indexstats-data">([\s\S]*?)<\/script>/);
