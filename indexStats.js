@@ -656,7 +656,6 @@
         const notHosting = [];
         let maxOps = 0;
         let minAge = Infinity;
-        let clusterSize = 0;
         let firstSpec = null;
 
         for (const m of reachable) {
@@ -714,7 +713,6 @@
 
           maxOps = Math.max(maxOps, ops);
           minAge = Math.min(minAge, ageDays);
-          clusterSize += store.sizeBytes;
           perNode.push({ host: m.host, shard: shardOfHost.get(m.host) ?? null,
                          present: true, ops, since,
                          counterAgeDays: ageDays, sizeBytes: store.sizeBytes,
@@ -722,7 +720,6 @@
                          cacheBytes: store.cacheBytes, error: null });
         }
 
-        const presentNodes = perNode.filter((n) => n.present);
         const { name: _n, key: _k, v: _v, ns: _ns, ...options } = firstSpec ?? { key: {} };
         const perShardMap = new Map();
         for (const node of perNode) {
@@ -735,6 +732,26 @@
           agg.observedNodes += 1;
           perShardMap.set(key, agg);
         }
+        // Scale each shard's observed average by the members that shard
+        // actually has. Summing raw observed bytes would under-report any
+        // shard seen through mongos, where exactly one member answers, while
+        // a directly-collected shard contributes every replica - and the
+        // "reclaimable" headline would then be a number nobody can act on.
+        const shardByName = new Map(shardList.map((s) => [s.name ?? null, s]));
+        let clusterSize = 0;
+        let perMemberTotal = 0;
+        let sizeEstimated = false;
+        for (const agg of perShardMap.values()) {
+          const avgPerMember = agg.observedNodes ? agg.observedSizeBytes / agg.observedNodes : 0;
+          const record = shardByName.get(agg.shard);
+          const expected = record && record.expectedHosts && record.expectedHosts.length
+            ? record.expectedHosts.length : agg.observedNodes;
+          if (expected > agg.observedNodes) sizeEstimated = true;
+          agg.sizeBytes = Math.round(avgPerMember * expected);
+          clusterSize += agg.sizeBytes;
+          perMemberTotal += avgPerMember;
+        }
+        const shardCount = perShardMap.size;
         built.push({
           ns, name,
           key: firstSpec?.key ?? {},
@@ -743,9 +760,9 @@
           perNode, maxOps,
           perShard: [...perShardMap.values()],
           minCounterAgeDays: minAge === Infinity ? null : minAge,
-          clusterSizeBytes: clusterSize,
-          perMemberSizeBytes: presentNodes.length
-            ? Math.round(clusterSize / presentNodes.length) : 0,
+          clusterSizeBytes: Math.round(clusterSize),
+          perMemberSizeBytes: shardCount ? Math.round(perMemberTotal / shardCount) : 0,
+          sizeEstimated,
           redundancy: { class: null, coveredBy: null },
           definition: {
             consistent: missingOn.length === 0 && variants.size <= 1,
@@ -1610,7 +1627,8 @@ function drawTable(){
       (i.flags.length?'<div class="muted">'+h(i.flags.join(', '))+'</div>':'')+'</td>'+
       '<td class="num">'+i.maxOps+'</td>'+
       '<td class="num">'+(i.minCounterAgeDays===null?'-':i.minCounterAgeDays.toFixed(0)+' d')+'</td>'+
-      '<td class="num">'+fmtBytes(i.clusterSizeBytes)+'</td></tr>'+
+      '<td class="num">'+fmtBytes(i.clusterSizeBytes)+
+      (i.sizeEstimated?'<div class="muted">estimated</div>':'')+'</td></tr>'+
       '<tr class="detail" id="d'+n+'" hidden><td colspan="5">'+detailFor(i)+'</td></tr>';
   }).join('');
   document.getElementById('table-host').innerHTML = head + body + '</tbody></table>';

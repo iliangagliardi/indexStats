@@ -295,3 +295,92 @@ test('a non-sharded deployment still works with no shards argument at all', () =
   assert.deepEqual(idx.definition.notHosting, []);
   assert.deepEqual(merged.namespaces[0].shards, [null]);
 });
+
+function shardedPayload({ shardAObserved, shardAExpected, sizePerMember }) {
+  const since = new Date('2026-01-01T00:00:00Z');
+  const members = shardAObserved.map((h) => ({ host: h, shard: 'shardA', reachable: true, hidden: false }));
+  const nodeResults = shardAObserved.map((h) => ({
+    host: h, shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+    collections: { 'shop.orders': {
+      indexes: [{ name: 'a_1', key: { a: 1 } }],
+      usage: { a_1: { ops: 0, since } },
+      storage: { a_1: { sizeBytes: sizePerMember, reusableBytes: 0, cacheBytes: 0 } },
+      error: null } },
+  }));
+  return mergeNodes({
+    members, nodeResults, samples: [], now: new Date(),
+    shards: [{ name: 'shardA', coverage: 'full', expectedHosts: shardAExpected, observedHosts: shardAObserved }],
+  });
+}
+
+test('a fully observed shard sums exactly as it always has', () => {
+  const merged = shardedPayload({
+    shardAObserved: ['h1:27017', 'h2:27017', 'h3:27017'],
+    shardAExpected: ['h1:27017', 'h2:27017', 'h3:27017'],
+    sizePerMember: 100,
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.equal(idx.clusterSizeBytes, 300);
+  assert.equal(idx.perMemberSizeBytes, 100);
+  assert.equal(idx.sizeEstimated, false);
+});
+
+test('a shard observed on one of three members is scaled up, and flagged as an estimate', () => {
+  const merged = shardedPayload({
+    shardAObserved: ['h1:27017'],
+    shardAExpected: ['h1:27017', 'h2:27017', 'h3:27017'],
+    sizePerMember: 100,
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.equal(idx.clusterSizeBytes, 300);
+  assert.equal(idx.perMemberSizeBytes, 100);
+  assert.equal(idx.sizeEstimated, true);
+});
+
+test('cluster size adds shards together, each scaled by its own member count', () => {
+  const since = new Date('2026-01-01T00:00:00Z');
+  const mk = (host, shard, size) => ({
+    host, shard, namespaces: ['shop.orders'], skipped: [],
+    collections: { 'shop.orders': {
+      indexes: [{ name: 'a_1', key: { a: 1 } }],
+      usage: { a_1: { ops: 0, since } },
+      storage: { a_1: { sizeBytes: size, reusableBytes: 0, cacheBytes: 0 } },
+      error: null } },
+  });
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h2:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    nodeResults: [mk('h1:27017', 'shardA', 100), mk('h2:27017', 'shardA', 100), mk('h3:27017', 'shardB', 50)],
+    samples: [], now: new Date(),
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017', 'h2:27017'] },
+      // shardB has three members but only one answered, via mongos.
+      { name: 'shardB', coverage: 'partial', expectedHosts: ['h3:27017', 'h4:27017', 'h5:27017'], observedHosts: ['h3:27017'] },
+    ],
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  // shardA: 100 x 2 = 200.  shardB: 50 x 3 = 150.  Total 350.
+  assert.equal(idx.clusterSizeBytes, 350);
+  assert.equal(idx.sizeEstimated, true);
+  assert.equal(idx.perShard.find((s) => s.shard === 'shardB').sizeBytes, 150);
+});
+
+test('an unobserved shard contributes nothing rather than NaN', () => {
+  const merged = mergeNodes({
+    members: [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false }],
+    nodeResults: [{ host: 'h1:27017', shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+      collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: {},
+        storage: { a_1: { sizeBytes: 10, reusableBytes: 0, cacheBytes: 0 } }, error: null } } }],
+    samples: [], now: new Date(),
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'] },
+      { name: 'shardB', coverage: 'none', expectedHosts: ['h9:27017'], observedHosts: [] },
+    ],
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.equal(idx.clusterSizeBytes, 10);
+  assert.equal(Number.isFinite(idx.clusterSizeBytes), true);
+});
