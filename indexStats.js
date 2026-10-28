@@ -1411,8 +1411,13 @@
     // case as NOT a coverage gap.
     const presentHosts = new Set(idx.perNode.filter((n) => n.present).map((n) => n.host));
     const confirmedAbsentHosts = new Set(idx.definition.missingOn ?? []);
+    // A member whose shard does not hold this collection was never supposed to
+    // report it. Counting it as an unobserved member would make every index on
+    // an unsharded collection inconclusive on a sharded cluster.
+    const notHostingHosts = new Set(idx.definition.notHosting ?? []);
     const unobservedHosts = (ctx.reachableHosts ?? [])
-      .filter((h) => !presentHosts.has(h) && !confirmedAbsentHosts.has(h));
+      .filter((h) => !presentHosts.has(h) && !confirmedAbsentHosts.has(h)
+                     && !notHostingHosts.has(h));
     if (unobservedHosts.length) {
       const detail = unobservedHosts.map((h) => {
         const node = idx.perNode.find((n) => n.host === h);
@@ -1421,6 +1426,34 @@
       flags.push('unobserved-member');
       reasons.unshift(`no observation for this index on ${detail} - a zero-operation `
         + 'verdict cannot be confirmed there, so this index cannot be dropped yet');
+      return { verdict: 'inconclusive', flags, reasons };
+    }
+
+    // Sharded safety gate. An index can only be called unused on a shard whose
+    // every data-bearing member was observed. Through a mongos only one member
+    // per shard answers - the one the connection's read preference selects - so
+    // the rest are unobserved and might be the ones using this index. On Atlas,
+    // where direct shard connections are refused, this is the ordinary outcome
+    // rather than an error, so the reason has to explain itself.
+    const hostingShardNames = (ctx.nsShards ?? {})[idx.ns] ?? null;
+    const gappy = (ctx.shards ?? []).filter((s) =>
+      s.coverage !== 'full'
+      && (hostingShardNames === null || hostingShardNames.includes(s.name)));
+    if (gappy.length) {
+      flags.push('partial-shard-coverage');
+      const detail = gappy.map((s) => {
+        if (s.coverage === 'none') {
+          return `${s.name} returned no data at all${s.error ? ` (${s.error})` : ''}`;
+        }
+        const seen = s.observedHosts.join(', ');
+        return s.mode === 'indirect'
+          ? `${s.name} was observed through mongos on ${seen} only `
+            + `(readPreference ${s.readPref}), so its remaining members were never consulted`
+          : `${s.name} was observed on ${seen} only, so its remaining members were never consulted`;
+      }).join('; ');
+      reasons.unshift(`zero operations everywhere observed, but ${detail} - unused cannot be `
+        + 'confirmed cluster-wide. Connect with readPreference=secondaryPreferred, or run '
+        + 'against each shard directly, to widen coverage');
       return { verdict: 'inconclusive', flags, reasons };
     }
 
@@ -1448,6 +1481,8 @@
     const hiddenHosts = payload.members.filter((m) => m.hidden).map((m) => m.host);
     const unreachableHosts = payload.gaps.unreachableMembers.map((m) => m.host);
     const reachableHosts = payload.members.filter((m) => m.reachable).map((m) => m.host);
+    const nsShards = {};
+    for (const n of payload.namespaces ?? []) nsShards[n.ns] = n.shards ?? null;
     const sampleByNs = new Map((samples ?? []).map((s) => [s.ns, s]));
 
     for (const idx of payload.indexes) {
@@ -1459,7 +1494,8 @@
                 validator: sample.validator }, config)
           : [],
       };
-      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts, reachableHosts }));
+      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts,
+        reachableHosts, shards: payload.shards ?? [], nsShards }));
     }
 
     payload.indexes.sort((a, b) => {

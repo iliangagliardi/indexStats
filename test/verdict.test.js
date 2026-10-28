@@ -175,3 +175,105 @@ test('applyAnalysis ranks drop candidates first, then by cluster size', () => {
   const out = applyAnalysis(payload, CONFIG, []);
   assert.deepEqual(out.indexes.map((i) => i.name), ['big_drop', 'small_drop', 'keeper']);
 });
+
+// An index that would otherwise be a clean drop: old counter, zero ops,
+// present and consistent everywhere that hosts it.
+function droppableIndex(overrides) {
+  const old = new Date(Date.now() - 400 * 86400000);
+  return Object.assign({
+    ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
+    maxOps: 0, minCounterAgeDays: 400, clusterSizeBytes: 100,
+    redundancy: { class: null, coveredBy: null },
+    schema: { checks: [] },
+    definition: { consistent: true, missingOn: [], notHosting: [], variants: [] },
+    perNode: [{ host: 'h1:27017', shard: 'shardA', present: true, ops: 0, since: old,
+                counterAgeDays: 400, sizeBytes: 100, reusableBytes: 0, cacheBytes: 0, error: null }],
+    perShard: [{ shard: 'shardA', ops: 0, sizeBytes: 100, observedNodes: 1, present: true }],
+  }, overrides);
+}
+
+const BASE_CTX = {
+  config: { DROP_MIN_COUNTER_DAYS: 14 },
+  hiddenHosts: [], unreachableHosts: [], reachableHosts: ['h1:27017'],
+  shards: [{ name: 'shardA', coverage: 'full', mode: 'direct', observedHosts: ['h1:27017'],
+             expectedHosts: ['h1:27017'], readPref: 'secondaryPreferred' }],
+  nsShards: { 'shop.orders': ['shardA'] },
+};
+
+test('a fully covered shard still allows a drop verdict', () => {
+  const out = deriveVerdict(droppableIndex(), BASE_CTX);
+  assert.equal(out.verdict, 'likely-drop');
+});
+
+test('a partially covered shard downgrades a zero-ops index to inconclusive', () => {
+  const ctx = Object.assign({}, BASE_CTX, {
+    shards: [{ name: 'shardA', coverage: 'partial', mode: 'indirect',
+               observedHosts: ['h1:27017'], expectedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+               readPref: 'primary' }],
+  });
+  const out = deriveVerdict(droppableIndex(), ctx);
+  assert.equal(out.verdict, 'inconclusive');
+  assert.ok(out.flags.includes('partial-shard-coverage'));
+});
+
+test('the partial-coverage reason names the shard, how it was reached, and the read preference', () => {
+  const ctx = Object.assign({}, BASE_CTX, {
+    shards: [{ name: 'shardA', coverage: 'partial', mode: 'indirect',
+               observedHosts: ['h1:27017'], expectedHosts: ['h1:27017', 'h2:27017', 'h3:27017'],
+               readPref: 'primary' }],
+  });
+  const reason = deriveVerdict(droppableIndex(), ctx).reasons.join(' ');
+  assert.match(reason, /shardA/);
+  assert.match(reason, /mongos/);
+  assert.match(reason, /primary/);
+});
+
+test('a shard that answered nothing downgrades, and says so distinctly', () => {
+  const ctx = Object.assign({}, BASE_CTX, {
+    shards: [{ name: 'shardA', coverage: 'none', mode: 'indirect', observedHosts: [],
+               expectedHosts: ['h1:27017'], readPref: 'primary', error: 'Unauthorized' }],
+  });
+  const out = deriveVerdict(droppableIndex(), ctx);
+  assert.equal(out.verdict, 'inconclusive');
+  assert.match(out.reasons.join(' '), /no data at all/);
+});
+
+test('a partially covered shard that does NOT host this namespace does not downgrade it', () => {
+  const ctx = Object.assign({}, BASE_CTX, {
+    shards: [
+      { name: 'shardA', coverage: 'full', mode: 'direct', observedHosts: ['h1:27017'],
+        expectedHosts: ['h1:27017'], readPref: 'secondaryPreferred' },
+      { name: 'shardB', coverage: 'partial', mode: 'indirect', observedHosts: ['h9:27017'],
+        expectedHosts: ['h9:27017', 'h8:27017'], readPref: 'primary' },
+    ],
+    nsShards: { 'shop.orders': ['shardA'] },
+  });
+  assert.equal(deriveVerdict(droppableIndex(), ctx).verdict, 'likely-drop');
+});
+
+test('a host whose shard does not hold the collection is not a coverage hole', () => {
+  const ctx = Object.assign({}, BASE_CTX, { reachableHosts: ['h1:27017', 'h9:27017'] });
+  const idx = droppableIndex({
+    definition: { consistent: true, missingOn: [], notHosting: ['h9:27017'], variants: [] },
+  });
+  const out = deriveVerdict(idx, ctx);
+  assert.equal(out.verdict, 'likely-drop');
+  assert.equal(out.flags.includes('unobserved-member'), false);
+});
+
+test('an index in use on one shard is kept, never downgraded by another shard coverage gap', () => {
+  const ctx = Object.assign({}, BASE_CTX, {
+    shards: [{ name: 'shardA', coverage: 'partial', mode: 'indirect',
+               observedHosts: ['h1:27017'], expectedHosts: ['h1:27017', 'h2:27017'],
+               readPref: 'primary' }],
+  });
+  const idx = droppableIndex({ maxOps: 42,
+    perNode: [{ host: 'h1:27017', shard: 'shardA', present: true, ops: 42, since: new Date(),
+                counterAgeDays: 400, sizeBytes: 100, reusableBytes: 0, cacheBytes: 0, error: null }] });
+  assert.equal(deriveVerdict(idx, ctx).verdict, 'keep');
+});
+
+test('deriveVerdict still works when ctx carries no shard information at all', () => {
+  const ctx = Object.assign({}, BASE_CTX, { shards: undefined, nsShards: undefined });
+  assert.equal(deriveVerdict(droppableIndex(), ctx).verdict, 'likely-drop');
+});
