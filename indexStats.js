@@ -164,6 +164,30 @@
     return { setName: setName || null, hosts };
   }
 
+  // Enumerates the cluster's shards from a mongos. Deliberately does NOT
+  // catch: unlike `discoverMembers`, where "no replication configured" is a
+  // legitimate standalone, there is no safe degraded reading of a failed
+  // listShards on a mongos - reporting a subset of shards as if it were the
+  // cluster is exactly the mistake that leads to dropping an index another
+  // shard still uses. Let it propagate to main()'s FATAL handler.
+  function discoverShards(adminDb, config) {
+    const res = adminDb.runCommand({ listShards: 1, maxTimeMS: config.MAX_TIME_MS });
+    const entries = res.shards ?? [];
+    return entries.map((s) => {
+      const parsed = parseShardHost(s.host);
+      return {
+        name: s._id,
+        setName: parsed.setName,
+        hosts: parsed.hosts,
+        state: Number(s.state ?? 1),
+        // A draining shard still holds data and still has indexes, so it is
+        // collected like any other; `draining` is surfaced in the report so a
+        // reader can discount it, not used to skip the shard.
+        draining: Boolean(s.draining),
+      };
+    }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  }
+
   function discoverMembers(adminDb, config) {
     const hello = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
     if (hello.msg === 'isdbgrid') {
@@ -1506,7 +1530,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
