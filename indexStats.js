@@ -472,7 +472,18 @@
       let shardError = null;
       try {
         const seedConn = new MongoCtor(uriFor(config.URI_TEMPLATE, shard.hosts[0]));
-        const discovered = discoverMembers(seedConn.getDB('admin'), config);
+        // SEED_HOST must be shard-scoped here. The enclosing config's SEED_HOST
+        // identifies the MONGOS this run connected to, not this shard - so if a
+        // shard ever takes discoverMembers' single-node fallback (replSetGetConfig
+        // reports NoReplicationEnabled, i.e. a bare standalone shard), that
+        // fallback would label the shard's one member with the ROUTER's host.
+        // buildShardRecord would then compare that fabricated identity against
+        // itself, report coverage 'full', and unlock drop verdicts for a shard
+        // nobody actually identified. Same failure class as the real-cluster bug
+        // behind selectCollectionTargets: identity must never be inherited from
+        // whichever connection happened to be in scope.
+        const discovered = discoverMembers(seedConn.getDB('admin'),
+          { ...config, SEED_HOST: shard.hosts[0] });
         for (const member of discovered.members) {
           member.shard = shard.name;
           shardMembers.push(member);

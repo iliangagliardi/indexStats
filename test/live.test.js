@@ -500,3 +500,178 @@ test('collectSharded marks every member of an indirect shard with its shard name
   });
   for (const m of out.members) assert.equal(m.shard, 'shardA');
 });
+
+// Direct mode is the ONLY path that can produce coverage 'full', and therefore
+// the only path that can ever unlock a drop verdict - so it gets its own fakes
+// rather than being trusted because it resembles main()'s replica-set loop.
+//
+// URI_TEMPLATE is the bare '{host}' placeholder so uriFor() returns the host
+// unchanged and the fake constructor can dispatch on it directly. (uriFor still
+// enforces the placeholder, so this exercises the real substitution.)
+const DIRECT_CONFIG = {
+  EXCLUDED_DBS: ['admin', 'config', 'local'], MAX_TIME_MS: 30000,
+  INCLUDE_HIDDEN: true, URI_TEMPLATE: '{host}',
+  // Deliberately the MONGOS's host: if collectSharded ever let discoverMembers'
+  // single-node fallback inherit this, a shard member would be labelled with the
+  // router's identity.
+  SEED_HOST: 'mongos:27017',
+};
+
+// One fake shard member. Surfaces: discoverMembers' replSetGetConfig,
+// collectSharded's per-member hello, and everything collectFromNode touches.
+// A null rsConfig stands in for a bare standalone shard, where
+// replSetGetConfig reports NoReplicationEnabled and discoverMembers takes its
+// single-node fallback.
+function fakeShardMemberConn(host, rsConfig) {
+  return {
+    setReadPref() {},
+    getDB(name) {
+      return {
+        runCommand(cmd) {
+          if (cmd.hello) {
+            assert.equal(cmd.maxTimeMS, DIRECT_CONFIG.MAX_TIME_MS, 'hello must carry maxTimeMS');
+            return { isWritablePrimary: !rsConfig || host === rsConfig.members[0].host };
+          }
+          if (cmd.replSetGetConfig) {
+            assert.equal(cmd.maxTimeMS, DIRECT_CONFIG.MAX_TIME_MS,
+              'replSetGetConfig must carry maxTimeMS');
+            if (!rsConfig) {
+              const e = new Error('not running with --replSet');
+              e.codeName = 'NoReplicationEnabled';
+              throw e;
+            }
+            return { config: rsConfig };
+          }
+          throw new Error('unexpected command ' + JSON.stringify(cmd));
+        },
+        adminCommand(cmd) {
+          assert.equal(cmd.maxTimeMS, DIRECT_CONFIG.MAX_TIME_MS, 'listDatabases must carry maxTimeMS');
+          return { databases: [{ name: 'admin' }, { name: 'shop' }] };
+        },
+        getCollectionInfos() { return name === 'shop' ? [{ name: 'orders' }] : []; },
+        getCollection() {
+          return {
+            aggregate(pipeline, options) {
+              assert.equal(options.maxTimeMS, DIRECT_CONFIG.MAX_TIME_MS,
+                'aggregations must carry maxTimeMS');
+              const stage = Object.keys(pipeline[0])[0];
+              if (stage === '$collStats') {
+                return { toArray() { return [{ storageStats: { indexSizes: { _id_: 10 } } }]; } };
+              }
+              return { toArray() {
+                return [{ name: '_id_', accesses: { ops: 3, since: SINCE } }];
+              } };
+            },
+            getIndexes() { return [{ name: '_id_', key: { _id: 1 } }]; },
+          };
+        },
+      };
+    },
+  };
+}
+
+// A mongos connection that must never be touched: collectSharded is forbidden
+// from falling back to mongos for a shard it reached directly.
+const POISON_MONGOS = {
+  getDB() { throw new Error('collectSharded must not fall back to mongos for a direct shard'); },
+};
+
+const SHARD_A_RSCONFIG = {
+  _id: 'shardA',
+  members: [{ _id: 0, host: 'h1:27017' }, { _id: 1, host: 'h2:27017' }],
+};
+const SHARD_A = { name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+                  state: 1, draining: false };
+
+test('collectSharded collects a fully reachable shard directly, with full coverage', () => {
+  const out = collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [SHARD_A],
+    MongoCtor: function (host) { return fakeShardMemberConn(host, SHARD_A_RSCONFIG); },
+    canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+
+  assert.equal(out.shardRecords.length, 1);
+  assert.equal(out.shardRecords[0].mode, 'direct');
+  assert.equal(out.shardRecords[0].coverage, 'full');
+  assert.deepEqual(out.shardRecords[0].observedHosts, ['h1:27017', 'h2:27017']);
+  assert.deepEqual(out.shardRecords[0].expectedHosts, ['h1:27017', 'h2:27017']);
+  // Direct collection sets its own read preference, so it reports that, not the
+  // router's.
+  assert.equal(out.shardRecords[0].readPref, 'secondaryPreferred');
+  assert.equal(out.shardRecords[0].error, null);
+
+  assert.deepEqual(out.members.map((m) => m.host), ['h1:27017', 'h2:27017']);
+  for (const m of out.members) {
+    assert.equal(m.reachable, true);
+    assert.equal(m.shard, 'shardA');
+    assert.equal(m.error, null);
+  }
+  assert.deepEqual(out.members.map((m) => m.role), ['primary', 'secondary']);
+
+  // Node results are attributed per member, by the host passed in explicitly -
+  // never read off the connection object.
+  assert.deepEqual(out.nodeResults.map((r) => r.host), ['h1:27017', 'h2:27017']);
+  for (const r of out.nodeResults) {
+    assert.equal(r.shard, 'shardA');
+    assert.deepEqual(r.namespaces, ['shop.orders']);
+  }
+});
+
+test('a directly-reached shard whose member fails is partial coverage, never retried through mongos', () => {
+  const printed = [];
+  const out = collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [SHARD_A],
+    MongoCtor: function (host) {
+      if (host === 'h2:27017') {
+        const e = new Error('connection refused');
+        e.codeName = 'HostUnreachable';
+        throw e;
+      }
+      return fakeShardMemberConn(host, SHARD_A_RSCONFIG);
+    },
+    canOpenConnections: true, readPref: 'primary', printFn(msg) { printed.push(msg); },
+  });
+
+  // Exactly one record, still 'direct': a partly-answering direct shard is
+  // reported as partial, NOT re-collected through the router.
+  assert.equal(out.shardRecords.length, 1);
+  assert.equal(out.shardRecords[0].mode, 'direct');
+  assert.equal(out.shardRecords[0].coverage, 'partial');
+  assert.deepEqual(out.shardRecords[0].observedHosts, ['h1:27017']);
+  // The unreachable member still counts towards what full coverage would mean.
+  assert.deepEqual(out.shardRecords[0].expectedHosts, ['h1:27017', 'h2:27017']);
+  // The shard as a whole did not fail - only one of its members did.
+  assert.equal(out.shardRecords[0].error, null);
+
+  const down = out.members.find((m) => m.host === 'h2:27017');
+  assert.equal(down.reachable, false);
+  assert.equal(down.error, 'HostUnreachable');
+  assert.equal(down.shard, 'shardA');
+  const up = out.members.find((m) => m.host === 'h1:27017');
+  assert.equal(up.reachable, true);
+
+  assert.deepEqual(out.nodeResults.map((r) => r.host), ['h1:27017']);
+  assert.ok(printed.some((m) => /h2:27017 unreachable/.test(m)),
+    'the unreachable member must be reported to the operator');
+});
+
+// Regression for the mislabelling fix: a standalone (non-replica-set) shard
+// takes discoverMembers' single-node fallback, which names its member from
+// SEED_HOST. That must be the SHARD's host, not the mongos the run connected
+// to - otherwise buildShardRecord compares a fabricated identity against itself
+// and reports coverage 'full' for a shard nobody correctly identified.
+test('a standalone shard is identified by its own host, never by the mongos SEED_HOST', () => {
+  const standalone = { name: 'shardS', setName: null, hosts: ['s1:27017'],
+                       state: 1, draining: false };
+  const out = collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [standalone],
+    MongoCtor: function (host) { return fakeShardMemberConn(host, null); },
+    canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+
+  assert.deepEqual(out.members.map((m) => m.host), ['s1:27017']);
+  assert.notEqual(out.members[0].host, DIRECT_CONFIG.SEED_HOST);
+  assert.deepEqual(out.shardRecords[0].expectedHosts, ['s1:27017']);
+  assert.deepEqual(out.shardRecords[0].observedHosts, ['s1:27017']);
+  assert.deepEqual(out.nodeResults.map((r) => r.host), ['s1:27017']);
+});
