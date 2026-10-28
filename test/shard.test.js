@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectTopology, parseShardHost } = require('../indexStats.js');
+const { detectTopology, parseShardHost, demuxShardStats } = require('../indexStats.js');
 
 test('detectTopology recognises a mongos by its isdbgrid marker', () => {
   assert.equal(detectTopology({ msg: 'isdbgrid', ok: 1 }), 'sharded');
@@ -83,4 +83,88 @@ test('discoverShards keeps a draining shard, because its indexes still exist', (
 test('discoverShards throws when listShards fails - a sharded run cannot safely degrade', () => {
   const admin = { runCommand() { throw Object.assign(new Error('not authorized'), { codeName: 'Unauthorized' }); } };
   assert.throws(() => discoverShards(admin, SHARD_CONFIG), /not authorized/);
+});
+
+const SINCE_A = new Date('2026-01-01T00:00:00Z');
+const SINCE_B = new Date('2026-02-01T00:00:00Z');
+
+test('demuxShardStats separates storage statistics by shard', () => {
+  const out = demuxShardStats([
+    { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 100, a_1: 50 } } },
+    { shard: 'shardB', host: 'h3:27017', storageStats: { indexSizes: { _id_: 200, a_1: 70 } } },
+  ], []);
+  assert.equal(out.byShard.shardA.storage._id_.sizeBytes, 100);
+  assert.equal(out.byShard.shardA.storage.a_1.sizeBytes, 50);
+  assert.equal(out.byShard.shardB.storage._id_.sizeBytes, 200);
+  assert.equal(out.byShard.shardB.storage.a_1.sizeBytes, 70);
+});
+
+test('demuxShardStats separates usage counters by shard and records the answering hosts', () => {
+  const out = demuxShardStats([], [
+    { shard: 'shardA', host: 'h1:27017', name: 'a_1', key: { a: 1 },
+      accesses: { ops: 12, since: SINCE_A }, spec: { name: 'a_1', key: { a: 1 }, v: 2 } },
+    { shard: 'shardB', host: 'h3:27017', name: 'a_1', key: { a: 1 },
+      accesses: { ops: 0, since: SINCE_B }, spec: { name: 'a_1', key: { a: 1 }, v: 2 } },
+  ]);
+  assert.equal(out.byShard.shardA.usage.a_1.ops, 12);
+  assert.equal(out.byShard.shardB.usage.a_1.ops, 0);
+  assert.deepEqual(out.byShard.shardA.hosts, ['h1:27017']);
+  assert.deepEqual(out.byShard.shardB.hosts, ['h3:27017']);
+});
+
+test('demuxShardStats takes the index spec from $indexStats, since getIndexes via mongos is merged', () => {
+  const out = demuxShardStats([], [
+    { shard: 'shardA', host: 'h1:27017', name: 'a_1', key: { a: 1 },
+      accesses: { ops: 1, since: SINCE_A },
+      spec: { name: 'a_1', key: { a: 1 }, v: 2, unique: true } },
+  ]);
+  assert.deepEqual(out.byShard.shardA.indexes, [{ name: 'a_1', key: { a: 1 }, v: 2, unique: true }]);
+});
+
+test('demuxShardStats synthesises a minimal spec when the server omits one', () => {
+  const out = demuxShardStats([], [
+    { shard: 'shardA', host: 'h1:27017', name: 'a_1', key: { a: 1 },
+      accesses: { ops: 1, since: SINCE_A } },
+  ]);
+  assert.deepEqual(out.byShard.shardA.indexes, [{ name: 'a_1', key: { a: 1 } }]);
+});
+
+test('demuxShardStats sums several documents from the same shard and keeps the earliest counter', () => {
+  const out = demuxShardStats([], [
+    { shard: 'shardA', host: 'h1:27017', name: 'a_1', key: { a: 1 }, accesses: { ops: 5, since: SINCE_B } },
+    { shard: 'shardA', host: 'h2:27017', name: 'a_1', key: { a: 1 }, accesses: { ops: 7, since: SINCE_A } },
+  ]);
+  assert.equal(out.byShard.shardA.usage.a_1.ops, 12);
+  assert.deepEqual(out.byShard.shardA.usage.a_1.since, SINCE_A);
+  assert.deepEqual(out.byShard.shardA.hosts, ['h1:27017', 'h2:27017']);
+});
+
+test('demuxShardStats reads reusable and cache bytes from indexDetails', () => {
+  const out = demuxShardStats([
+    { shard: 'shardA', host: 'h1:27017', storageStats: {
+      indexSizes: { a_1: 50 },
+      indexDetails: { a_1: {
+        'block-manager': { 'file bytes available for reuse': 16384 },
+        cache: { 'bytes currently in the cache': 4096 } } } } },
+  ], []);
+  assert.equal(out.byShard.shardA.storage.a_1.reusableBytes, 16384);
+  assert.equal(out.byShard.shardA.storage.a_1.cacheBytes, 4096);
+});
+
+test('demuxShardStats flags documents that carry no shard field', () => {
+  const out = demuxShardStats([
+    { host: 'h1:27017', storageStats: { indexSizes: { _id_: 100 } } },
+  ], []);
+  assert.equal(out.unattributed, true);
+});
+
+test('demuxShardStats reports unattributed false when every document is tagged', () => {
+  const out = demuxShardStats([
+    { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 100 } } },
+  ], []);
+  assert.equal(out.unattributed, false);
+});
+
+test('demuxShardStats returns an empty result for empty input', () => {
+  assert.deepEqual(demuxShardStats([], []), { byShard: {}, unattributed: false });
 });

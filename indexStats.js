@@ -420,6 +420,71 @@
     return result;
   }
 
+  // Pure: on a sharded cluster, $collStats and $indexStats run through a
+  // mongos return one document per shard, each tagged with `shard` and the
+  // `host` that answered. Split those tagged documents into the same
+  // per-collection entry shape collectFromNode builds, one entry per shard.
+  //
+  // Index SPECS come from $indexStats' `spec` field rather than getIndexes():
+  // through a mongos, getIndexes() returns a single merged list with no shard
+  // attribution, so it cannot tell us which shard actually holds which index -
+  // and "which shard is missing this index" is precisely the mismatched-index
+  // finding we need. Servers that omit `spec` still give us `name` and `key`,
+  // which is enough to record presence.
+  function demuxShardStats(collStatsDocs, indexStatsDocs) {
+    const byShard = {};
+    let unattributed = false;
+    const entryFor = (shard) => {
+      if (!byShard[shard]) {
+        byShard[shard] = { indexes: [], usage: {}, storage: {}, hosts: [] };
+      }
+      return byShard[shard];
+    };
+    const noteHost = (entry, host) => {
+      if (host && !entry.hosts.includes(host)) entry.hosts.push(host);
+    };
+    const shardOf = (doc) => {
+      if (doc && doc.shard) return doc.shard;
+      unattributed = true;
+      return 'unknown';
+    };
+
+    for (const doc of collStatsDocs ?? []) {
+      const entry = entryFor(shardOf(doc));
+      noteHost(entry, doc.host);
+      const s = doc.storageStats ?? {};
+      for (const [name, size] of Object.entries(s.indexSizes ?? {})) {
+        const e = entry.storage[name] ?? (entry.storage[name] =
+          { sizeBytes: 0, reusableBytes: 0, cacheBytes: 0 });
+        e.sizeBytes += Number(size ?? 0);
+      }
+      for (const [name, det] of Object.entries(s.indexDetails ?? {})) {
+        const e = entry.storage[name] ?? (entry.storage[name] =
+          { sizeBytes: 0, reusableBytes: 0, cacheBytes: 0 });
+        e.reusableBytes += Number(det?.['block-manager']?.['file bytes available for reuse'] ?? 0);
+        e.cacheBytes += Number(det?.cache?.['bytes currently in the cache'] ?? 0);
+      }
+    }
+
+    for (const doc of indexStatsDocs ?? []) {
+      const entry = entryFor(shardOf(doc));
+      noteHost(entry, doc.host);
+      const ops = Number(doc?.accesses?.ops ?? 0);
+      const since = doc?.accesses?.since;
+      const use = entry.usage[doc.name] ?? (entry.usage[doc.name] = { ops: 0, since });
+      use.ops += ops;
+      if (since && (!use.since || since < use.since)) use.since = since;
+      // Do not write `entry.indexes?.find(...)` here: mongosh's async-rewriter
+      // breaks optional chaining immediately before `.find(`. Resolve the array
+      // on its own line first.
+      const specs = entry.indexes;
+      const known = specs.find((s) => s.name === doc.name);
+      if (!known) specs.push(doc.spec ? doc.spec : { name: doc.name, key: doc.key });
+    }
+
+    return { byShard, unattributed };
+  }
+
   function mergeNodes({ members, nodeResults, samples, now }) {
     const at = now instanceof Date ? now : new Date();
     const byHost = new Map(nodeResults.map((r) => [r.host, r]));
@@ -1530,7 +1595,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
