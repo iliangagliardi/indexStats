@@ -337,6 +337,94 @@
     }
     return result;
   }
+
+  // Collects every namespace through a mongos, splitting the results per
+  // shard. Deliberately does NOT call conn.setReadPref: the whole point of
+  // the indirect path is to observe the cluster exactly as the user's own
+  // connection string does, and to REPORT the read preference rather than
+  // quietly widen it. Changing it here would make the coverage we report a
+  // fiction.
+  function collectFromMongos(conn, config, shardNames) {
+    const excluded = new Set(config.EXCLUDED_DBS);
+    const byShard = new Map();
+    const observedByShard = {};
+    for (const name of shardNames ?? []) {
+      byShard.set(name, { host: null, shard: name, namespaces: [], collections: {}, skipped: [] });
+      observedByShard[name] = { hosts: [], unattributed: false };
+    }
+    const nodeFor = (shard) => {
+      if (!byShard.has(shard)) {
+        byShard.set(shard, { host: null, shard, namespaces: [], collections: {}, skipped: [] });
+        observedByShard[shard] = { hosts: [], unattributed: false };
+      }
+      return byShard.get(shard);
+    };
+
+    const dbNames = conn.getDB('admin')
+      .adminCommand({ listDatabases: 1, nameOnly: true, maxTimeMS: config.MAX_TIME_MS })
+      .databases.map((d) => d.name).filter((n) => !excluded.has(n)).sort();
+
+    for (const dbName of dbNames) {
+      let collNames = [];
+      try {
+        // Same documented R10 exception as collectFromNode: these helpers accept
+        // { maxTimeMS } but do not enforce it, and the raw commands would
+        // truncate at one cursor batch. The try/catch is what bounds the risk.
+        collNames = conn.getDB(dbName)
+          .getCollectionInfos({ type: 'collection' }, true)
+          .map((c) => c.name).filter((n) => !n.startsWith('system.')).sort();
+      } catch (e) {
+        for (const node of byShard.values()) {
+          node.skipped.push({ ns: dbName, reason: e.codeName ?? e.message });
+        }
+        continue;
+      }
+
+      for (const collName of collNames) {
+        const ns = `${dbName}.${collName}`;
+        let demuxed;
+        try {
+          const coll = conn.getDB(dbName).getCollection(collName);
+          const collStatsDocs = coll
+            .aggregate([{ $collStats: { storageStats: {} } }], { maxTimeMS: config.MAX_TIME_MS })
+            .toArray();
+          const indexStatsDocs = coll
+            .aggregate([{ $indexStats: {} }], { maxTimeMS: config.MAX_TIME_MS })
+            .toArray();
+          demuxed = demuxShardStats(collStatsDocs, indexStatsDocs);
+        } catch (e) {
+          const reason = e.codeName ?? e.message;
+          for (const node of byShard.values()) node.skipped.push({ ns, reason });
+          continue;
+        }
+
+        for (const [shard, data] of Object.entries(demuxed.byShard)) {
+          const node = nodeFor(shard);
+          // The shard's first answering host identifies its single node.
+          // Claiming one node per answering host would assert per-member
+          // evidence this path does not have.
+          if (!node.host && data.hosts.length) node.host = data.hosts[0];
+          const seen = observedByShard[shard];
+          for (const h of data.hosts) {
+            if (!seen.hosts.includes(h)) seen.hosts.push(h);
+          }
+          if (demuxed.unattributed) seen.unattributed = true;
+          node.namespaces.push(ns);
+          node.collections[ns] = {
+            indexes: data.indexes, usage: data.usage, storage: data.storage, error: null,
+          };
+        }
+      }
+    }
+
+    const nodeResults = [...byShard.values()].map((node) => ({
+      ...node,
+      // A shard that answered nothing still needs a stable identity, or it
+      // would silently merge with another shard's entries downstream.
+      host: node.host ?? `${node.shard}/unobserved`,
+    }));
+    return { nodeResults, observedByShard };
+  }
   // --------------------------------------------------------------------------
 
   // ------------------------- redundancy detection ---------------------------
@@ -1595,7 +1683,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

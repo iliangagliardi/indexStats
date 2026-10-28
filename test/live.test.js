@@ -318,3 +318,134 @@ test('collectFromNode uses the explicit third argument over a differing conn.hos
   const r = collectFromNode(conn, CONFIG, 'explicit-host:27017');
   assert.equal(r.host, 'explicit-host:27017');
 });
+
+const { collectFromMongos } = require('../indexStats.js');
+
+const MONGOS_CONFIG = { EXCLUDED_DBS: ['admin', 'config', 'local'], MAX_TIME_MS: 30000 };
+const SINCE = new Date('2026-01-01T00:00:00Z');
+
+// A fake mongos connection. getCollectionInfos and the two aggregations are the
+// only surfaces collectFromMongos touches.
+function fakeMongos({ dbs, colls, collStats, indexStats }) {
+  return {
+    setReadPref() { throw new Error('collectFromMongos must never set read preference on a mongos'); },
+    getDB(name) {
+      return {
+        adminCommand() { return { databases: dbs.map((d) => ({ name: d })) }; },
+        getCollectionInfos() { return (colls[name] ?? []).map((c) => ({ name: c })); },
+        getCollection(collName) {
+          const ns = name + '.' + collName;
+          return {
+            aggregate(pipeline) {
+              const stage = Object.keys(pipeline[0])[0];
+              const docs = stage === '$collStats' ? (collStats[ns] ?? []) : (indexStats[ns] ?? []);
+              return { toArray() { return docs; } };
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+test('collectFromMongos produces one node result per shard, shaped like collectFromNode', () => {
+  const conn = fakeMongos({
+    dbs: ['admin', 'config', 'shop'],
+    colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 100 } } },
+      { shard: 'shardB', host: 'h3:27017', storageStats: { indexSizes: { _id_: 200 } } },
+    ]},
+    indexStats: { 'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', name: '_id_', key: { _id: 1 }, accesses: { ops: 5, since: SINCE } },
+      { shard: 'shardB', host: 'h3:27017', name: '_id_', key: { _id: 1 }, accesses: { ops: 0, since: SINCE } },
+    ]},
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA', 'shardB']);
+  const a = out.nodeResults.find((r) => r.shard === 'shardA');
+  const b = out.nodeResults.find((r) => r.shard === 'shardB');
+  assert.equal(a.host, 'h1:27017');
+  assert.equal(b.host, 'h3:27017');
+  assert.deepEqual(a.namespaces, ['shop.orders']);
+  assert.equal(a.collections['shop.orders'].usage._id_.ops, 5);
+  assert.equal(b.collections['shop.orders'].storage._id_.sizeBytes, 200);
+  assert.deepEqual(out.observedByShard.shardA.hosts, ['h1:27017']);
+});
+
+test('collectFromMongos excludes admin, config and local', () => {
+  const conn = fakeMongos({
+    dbs: ['admin', 'config', 'local', 'shop'],
+    colls: { shop: ['orders'], admin: ['x'], config: ['chunks'], local: ['y'] },
+    collStats: { 'shop.orders': [{ shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 1 } } }] },
+    indexStats: {},
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  assert.deepEqual(out.nodeResults.find((r) => r.shard === 'shardA').namespaces, ['shop.orders']);
+});
+
+test('collectFromMongos records a namespace only on the shards that actually returned data', () => {
+  const conn = fakeMongos({
+    dbs: ['shop'],
+    colls: { shop: ['orders', 'lookup'] },
+    // `lookup` is unsharded: it lives only on the primary shard, shardA.
+    collStats: {
+      'shop.orders': [
+        { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 10 } } },
+        { shard: 'shardB', host: 'h3:27017', storageStats: { indexSizes: { _id_: 10 } } },
+      ],
+      'shop.lookup': [
+        { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 10 } } },
+      ],
+    },
+    indexStats: {},
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA', 'shardB']);
+  assert.deepEqual(out.nodeResults.find((r) => r.shard === 'shardA').namespaces.sort(),
+    ['shop.lookup', 'shop.orders']);
+  assert.deepEqual(out.nodeResults.find((r) => r.shard === 'shardB').namespaces, ['shop.orders']);
+});
+
+test('collectFromMongos carries maxTimeMS on both aggregations', () => {
+  const seen = [];
+  const conn = {
+    getDB(name) {
+      return {
+        adminCommand() { return { databases: [{ name: 'shop' }] }; },
+        getCollectionInfos() { return name === 'shop' ? [{ name: 'orders' }] : []; },
+        getCollection() {
+          return { aggregate(pipeline, options) { seen.push(options); return { toArray() { return []; } }; } };
+        },
+      };
+    },
+  };
+  collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  assert.equal(seen.length, 2);
+  for (const o of seen) assert.equal(o.maxTimeMS, 30000);
+});
+
+test('collectFromMongos records a failing namespace as skipped without aborting the run', () => {
+  const conn = {
+    getDB(name) {
+      return {
+        adminCommand() { return { databases: [{ name: 'shop' }] }; },
+        getCollectionInfos() { return name === 'shop' ? [{ name: 'orders' }] : []; },
+        getCollection() {
+          return { aggregate() { throw Object.assign(new Error('nope'), { codeName: 'Unauthorized' }); } };
+        },
+      };
+    },
+  };
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  const node = out.nodeResults.find((r) => r.shard === 'shardA');
+  assert.deepEqual(node.skipped, [{ ns: 'shop.orders', reason: 'Unauthorized' }]);
+});
+
+test('collectFromMongos keeps a shard that returned nothing, with no observed hosts', () => {
+  const conn = fakeMongos({
+    dbs: ['shop'], colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [{ shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 1 } } }] },
+    indexStats: {},
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA', 'shardB']);
+  assert.deepEqual(out.observedByShard.shardB.hosts, []);
+});
