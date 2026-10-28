@@ -258,3 +258,133 @@ test('parsePeerPayloads throws a clear error naming the offending index for a no
     /PEER_PAYLOADS\[1\]/,
   );
 });
+
+// --- Task 9, Part 1: union shards[] by name -------------------------------
+
+const SHARD_LOCAL = { name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+  state: 1, draining: false, mode: 'direct', coverage: 'partial',
+  expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017'],
+  readPref: 'secondaryPreferred', error: null };
+
+function payloadWithShards(shards, members) {
+  return { members, shards, namespaces: [], indexes: [],
+           gaps: { unreachableMembers: [], skipped: [] },
+           meta: { mode: 'single-node' } };
+}
+
+test('mergePeerPayloads unions shard records by name', () => {
+  const local = payloadWithShards([SHARD_LOCAL],
+    [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const peer = payloadWithShards([{ ...SHARD_LOCAL, name: 'shardB', observedHosts: ['h3:27017'],
+    expectedHosts: ['h3:27017'], coverage: 'full' }],
+    [{ host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false }]);
+  const out = mergePeerPayloads(local, [peer]);
+  assert.deepEqual(out.shards.map((s) => s.name).sort(), ['shardA', 'shardB']);
+});
+
+test('a peer that observed more members of the same shard improves its coverage', () => {
+  const local = payloadWithShards([SHARD_LOCAL],
+    [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const peer = payloadWithShards([{ ...SHARD_LOCAL, coverage: 'full',
+    observedHosts: ['h1:27017', 'h2:27017'] }],
+    [{ host: 'h2:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const out = mergePeerPayloads(local, [peer]);
+  const a = out.shards.find((s) => s.name === 'shardA');
+  assert.equal(a.coverage, 'full');
+  assert.deepEqual(a.observedHosts.sort(), ['h1:27017', 'h2:27017']);
+});
+
+test('a peer with worse coverage never degrades a shard already fully observed', () => {
+  const local = payloadWithShards([{ ...SHARD_LOCAL, coverage: 'full',
+    observedHosts: ['h1:27017', 'h2:27017'] }],
+    [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const peer = payloadWithShards([{ ...SHARD_LOCAL, coverage: 'none', observedHosts: [] }], []);
+  const out = mergePeerPayloads(local, [peer]);
+  assert.equal(out.shards.find((s) => s.name === 'shardA').coverage, 'full');
+});
+
+test('merging the same sharded peer twice is a no-op', () => {
+  const local = payloadWithShards([SHARD_LOCAL],
+    [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const peer = payloadWithShards([{ ...SHARD_LOCAL, coverage: 'full',
+    observedHosts: ['h1:27017', 'h2:27017'] }],
+    [{ host: 'h2:27017', shard: 'shardA', reachable: true, hidden: false }]);
+  const once = mergePeerPayloads(local, [peer]);
+  const twice = mergePeerPayloads(local, [peer, peer]);
+  assert.deepEqual(twice.shards, once.shards);
+});
+
+test('mergePeerPayloads still works on payloads with no shards at all', () => {
+  const local = { members: [{ host: 'h1:27017', reachable: true, hidden: false }],
+    namespaces: [], indexes: [], gaps: { unreachableMembers: [], skipped: [] },
+    meta: { mode: 'single-node' } };
+  const peer = { members: [{ host: 'h2:27017', reachable: true, hidden: false }],
+    namespaces: [], indexes: [], gaps: { unreachableMembers: [], skipped: [] },
+    meta: { mode: 'single-node' } };
+  const out = mergePeerPayloads(local, [peer]);
+  assert.deepEqual(out.shards ?? [], []);
+});
+
+// --- Task 9, Part 2: recompute perShard/clusterSizeBytes/sizeEstimated ----
+// from the unioned perNode entries, mirroring mergeNodes' own arithmetic,
+// instead of a raw per-member sum (the Task 7 under-reporting bug).
+
+function shardedLocalPayload() {
+  return {
+    meta: { mode: 'single-node' },
+    members: [
+      { id: 0, host: 'h1:27017', role: 'primary', hidden: false, delaySecs: 0, votes: 1,
+        reachable: true, error: null, shard: 'shardA' },
+    ],
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+      state: 1, draining: false, mode: 'direct', coverage: 'partial',
+      expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017'],
+      readPref: 'secondaryPreferred', error: null }],
+    gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
+      shards: ['shardA'], hasValidator: false, sample: null }],
+    indexes: [{
+      ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
+      perNode: [{ host: 'h1:27017', shard: 'shardA', present: true, ops: 5, since: null,
+                  counterAgeDays: 40, sizeBytes: 1000, reusableBytes: 0, cacheBytes: 0, error: null }],
+      maxOps: 5, minCounterAgeDays: 40, clusterSizeBytes: 1000, perMemberSizeBytes: 1000,
+      perShard: [{ shard: 'shardA', ops: 5, observedSizeBytes: 1000, observedNodes: 1,
+                   present: true, sizeBytes: 1000 }],
+      sizeEstimated: true,
+      redundancy: { class: null, coveredBy: null },
+      definition: { consistent: true, missingOn: [], notHosting: [],
+                    variants: [{ key: { a: 1 }, hosts: ['h1:27017'] }] },
+      schema: { checks: [] },
+    }],
+  };
+}
+
+function noOpShardedPeer() {
+  return {
+    meta: { mode: 'single-node' },
+    members: [],
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+      state: 1, draining: false, mode: 'direct', coverage: 'partial',
+      expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017'],
+      readPref: 'secondaryPreferred', error: null }],
+    gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [],
+    indexes: [],
+  };
+}
+
+test('a shard observed on fewer members than expected scales clusterSizeBytes and flags sizeEstimated', () => {
+  const merged = mergePeerPayloads(shardedLocalPayload(), [noOpShardedPeer()]);
+  const idx = merged.indexes[0];
+  // observed average per member (1000, from the one observed member) scaled
+  // up to the shard's two expectedHosts, same arithmetic as mergeNodes.
+  assert.equal(idx.clusterSizeBytes, 2000);
+  assert.equal(idx.sizeEstimated, true);
+});
+
+test('merged non-sharded payload has unchanged aggregates and no sizeEstimated flag', () => {
+  const p = mergePeerPayloads(single('h1', 0, 40, 'likely-drop'), [single('h2', 0, 40, 'likely-drop')]);
+  assert.equal(p.indexes[0].clusterSizeBytes, 1000);
+  assert.equal(p.indexes[0].perMemberSizeBytes, 500);
+  assert.ok(!p.indexes[0].sizeEstimated);
+});

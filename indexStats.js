@@ -830,8 +830,35 @@
     const out = JSON.parse(JSON.stringify(local));
     const coveredHosts = new Set(out.members.filter((m) => m.reachable).map((m) => m.host));
     const byKey = new Map(out.indexes.map((i) => [`${i.ns} ${i.name}`, i]));
+    const COVERAGE_RANK = { none: 0, partial: 1, full: 2 };
+    out.shards = out.shards ?? [];
+    const shardByName = new Map(out.shards.map((s) => [s.name, s]));
 
     for (const peer of peers) {
+      // Shard records union by name. A peer that observed more members of a
+      // shard genuinely improves that shard's coverage; one that observed
+      // fewer must never degrade it, or re-pasting an older payload could
+      // silently turn a confirmed drop candidate into an estimate - or worse,
+      // the reverse.
+      for (const s of peer.shards ?? []) {
+        const known = shardByName.get(s.name);
+        if (!known) {
+          const copy = JSON.parse(JSON.stringify(s));
+          out.shards.push(copy);
+          shardByName.set(s.name, copy);
+          continue;
+        }
+        for (const h of s.observedHosts ?? []) {
+          if (!known.observedHosts.includes(h)) known.observedHosts.push(h);
+        }
+        if ((COVERAGE_RANK[s.coverage] ?? 0) > (COVERAGE_RANK[known.coverage] ?? 0)) {
+          known.coverage = s.coverage;
+          known.mode = s.mode;
+          known.readPref = s.readPref;
+          known.error = s.error ?? null;
+        }
+      }
+
       // Only a peer's OWN genuinely reachable members are evidence. A host
       // already covered (by local, or by an earlier peer this call) is left
       // alone - this is what makes re-pasting the same payload a no-op.
@@ -899,8 +926,39 @@
       const ages = present.map((n) => n.counterAgeDays)
         .filter((a) => a !== null && a !== undefined);
       idx.minCounterAgeDays = ages.length ? Math.min(...ages) : null;
-      idx.clusterSizeBytes = present.reduce((s, n) => s + Number(n.sizeBytes ?? 0), 0);
-      idx.perMemberSizeBytes = present.length ? Math.round(idx.clusterSizeBytes / present.length) : 0;
+      // Recompute clusterSizeBytes/perMemberSizeBytes/perShard/sizeEstimated
+      // from the unioned perNode entries exactly as mergeNodes does (~724-753),
+      // rather than a raw per-member sum - that undercounts any shard seen
+      // through mongos, where exactly one member answers, while a directly-
+      // collected shard contributes every replica (the Task 7 bug).
+      const perShardMap = new Map();
+      for (const n of present) {
+        const key = n.shard ?? null;
+        const agg = perShardMap.get(key)
+          ?? { shard: key, ops: 0, observedSizeBytes: 0, observedNodes: 0, present: true };
+        agg.ops = Math.max(agg.ops, Number(n.ops ?? 0));
+        agg.observedSizeBytes += Number(n.sizeBytes ?? 0);
+        agg.observedNodes += 1;
+        perShardMap.set(key, agg);
+      }
+      let clusterSize = 0;
+      let perMemberTotal = 0;
+      let sizeEstimated = false;
+      for (const agg of perShardMap.values()) {
+        const avgPerMember = agg.observedNodes ? agg.observedSizeBytes / agg.observedNodes : 0;
+        const record = shardByName.get(agg.shard);
+        const expected = record && record.expectedHosts && record.expectedHosts.length
+          ? record.expectedHosts.length : agg.observedNodes;
+        if (expected > agg.observedNodes) sizeEstimated = true;
+        agg.sizeBytes = Math.round(avgPerMember * expected);
+        clusterSize += agg.sizeBytes;
+        perMemberTotal += avgPerMember;
+      }
+      const shardCount = perShardMap.size;
+      idx.clusterSizeBytes = Math.round(clusterSize);
+      idx.perMemberSizeBytes = shardCount ? Math.round(perMemberTotal / shardCount) : 0;
+      idx.perShard = [...perShardMap.values()];
+      idx.sizeEstimated = sizeEstimated;
       // Same rule as mergeNodes' own missingOn (~365): a reachable member only
       // counts as "missing this index" when it demonstrably finished checking
       // this namespace without error - never when it simply was never observed
