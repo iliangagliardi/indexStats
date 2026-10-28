@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectTopology, parseShardHost, demuxShardStats, buildShardRecord } = require('../indexStats.js');
+const { detectTopology, parseShardHost, canonicalObservedHost, canProbeShardsDirectly, demuxShardStats, buildShardRecord } = require('../indexStats.js');
 
 test('detectTopology recognises a mongos by its isdbgrid marker', () => {
   assert.equal(detectTopology({ msg: 'isdbgrid', ok: 1 }), 'sharded');
@@ -233,4 +233,123 @@ test('buildShardRecord carries the implicit single shard of a non-sharded deploy
     readPref: 'secondaryPreferred', error: null, unattributed: false });
   assert.equal(rec.name, null);
   assert.equal(rec.coverage, 'full');
+});
+
+// canonicalObservedHost - reconciling the two spellings of one member.
+// VERIFIED on a real 8.0.21 sharded cluster (Task 12): listShards reported
+// "shardA/127.0.0.1:27031,127.0.0.1:27032" while $collStats/$indexStats tagged
+// their documents host "mongo-host-01:27031". Treating those as different
+// members discarded the entire indirect payload.
+
+test('buildShardRecord never reports full coverage when a host had to be inferred', () => {
+  // The port inference in canonicalObservedHost is sound, but "full coverage"
+  // is the single fact that unlocks a droppable verdict, so it may never rest
+  // on an inference about which member actually answered.
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: ['h1:27017', 'h2:27018'],
+    observedHosts: ['h1:27017', 'h2:27018'],
+    readPref: 'secondaryPreferred', error: null, unattributed: false,
+    inferredHosts: true });
+  assert.equal(rec.coverage, 'partial');
+});
+
+test('buildShardRecord still reports full coverage when every host matched exactly', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: ['h1:27017', 'h2:27018'],
+    observedHosts: ['h1:27017', 'h2:27018'],
+    readPref: 'secondaryPreferred', error: null, unattributed: false,
+    inferredHosts: false });
+  assert.equal(rec.coverage, 'full');
+});
+
+test('canonicalObservedHost keeps a host that already matches a configured member', () => {
+  assert.equal(
+    canonicalObservedHost('127.0.0.1:27031', ['127.0.0.1:27031', '127.0.0.1:27032']),
+    '127.0.0.1:27031');
+});
+
+test('canonicalObservedHost maps a differently-spelled host onto the member sharing its port', () => {
+  assert.equal(
+    canonicalObservedHost('mongo-host-01:27031', ['127.0.0.1:27031', '127.0.0.1:27032']),
+    '127.0.0.1:27031');
+  assert.equal(
+    canonicalObservedHost('mongo-host-01:27032', ['127.0.0.1:27031', '127.0.0.1:27032']),
+    '127.0.0.1:27032');
+});
+
+test('canonicalObservedHost refuses to guess when several members share the port', () => {
+  // The Atlas shape: every member listens on 27017, so the port identifies
+  // nothing. Returning the observed host unchanged is what keeps the caller
+  // from claiming it observed a configured member it never identified - and
+  // therefore from ever reporting full coverage on evidence it does not have.
+  const atlas = ['sh-00-00.abc.mongodb.net:27017', 'sh-00-01.abc.mongodb.net:27017',
+                 'sh-00-02.abc.mongodb.net:27017'];
+  assert.equal(canonicalObservedHost('something-else:27017', atlas), 'something-else:27017');
+});
+
+test('canonicalObservedHost still prefers an exact match when the port is ambiguous', () => {
+  const atlas = ['sh-00-00.abc.mongodb.net:27017', 'sh-00-01.abc.mongodb.net:27017'];
+  assert.equal(canonicalObservedHost('sh-00-01.abc.mongodb.net:27017', atlas),
+    'sh-00-01.abc.mongodb.net:27017');
+});
+
+test('canonicalObservedHost leaves a host with no port unchanged', () => {
+  assert.equal(canonicalObservedHost('bare-hostname', ['127.0.0.1:27031']), 'bare-hostname');
+});
+
+test('canonicalObservedHost ignores configured entries that carry no port', () => {
+  assert.equal(canonicalObservedHost('mongo-01:27031', ['bare-hostname']), 'mongo-01:27031');
+});
+
+test('canonicalObservedHost returns empty, missing or non-string input unchanged', () => {
+  assert.equal(canonicalObservedHost('', ['127.0.0.1:27031']), '');
+  assert.equal(canonicalObservedHost(null, ['127.0.0.1:27031']), null);
+  assert.equal(canonicalObservedHost(undefined, ['127.0.0.1:27031']), undefined);
+  assert.equal(canonicalObservedHost(42, ['127.0.0.1:27031']), 42);
+});
+
+test('canonicalObservedHost tolerates a missing or empty configured-host list', () => {
+  assert.equal(canonicalObservedHost('mongo-01:27031', undefined), 'mongo-01:27031');
+  assert.equal(canonicalObservedHost('mongo-01:27031', []), 'mongo-01:27031');
+});
+
+test('canonicalObservedHost handles an IPv6-style host by its last colon', () => {
+  assert.equal(canonicalObservedHost('[::1]:27031', ['127.0.0.1:27031']), '127.0.0.1:27031');
+});
+
+// canProbeShardsDirectly - which capability may gate direct per-shard collection.
+// VERIFIED on the same cluster: the capability probe builds its URI from
+// deriveSeedHost, which on a mongos is the ROUTER's own serverStatus().host. A
+// router reached over 127.0.0.1 self-reported a bare hostname that failed with
+// getaddrinfo ENOTFOUND, so every shard was downgraded to indirect collection
+// even though direct shard connections worked from that very shell.
+
+test('canProbeShardsDirectly allows direct collection when the probe succeeded', () => {
+  assert.equal(canProbeShardsDirectly({ canOpenConnections: true,
+    connectionBlockedReason: null }), true);
+});
+
+test('canProbeShardsDirectly allows direct collection when only the router URI failed', () => {
+  // template-failed says the ROUTER's address did not work. It says nothing
+  // about the shards, which collectSharded probes individually anyway.
+  assert.equal(canProbeShardsDirectly({ canOpenConnections: false,
+    connectionBlockedReason: 'template-failed' }), true);
+});
+
+test('canProbeShardsDirectly blocks direct collection when there is no Mongo constructor', () => {
+  // Compass's embedded shell: no connection can be opened to anything.
+  assert.equal(canProbeShardsDirectly({ canOpenConnections: false,
+    connectionBlockedReason: 'no-mongo-constructor' }), false);
+});
+
+test('canProbeShardsDirectly blocks direct collection when the template has no {host}', () => {
+  // template-invalid would fail identically for every shard, so trying each
+  // one only adds noise to the run.
+  assert.equal(canProbeShardsDirectly({ canOpenConnections: false,
+    connectionBlockedReason: 'template-invalid' }), false);
+});
+
+test('canProbeShardsDirectly is false for a missing capability object rather than throwing', () => {
+  assert.equal(canProbeShardsDirectly(null), false);
+  assert.equal(canProbeShardsDirectly(undefined), false);
 });

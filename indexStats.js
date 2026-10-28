@@ -164,6 +164,59 @@
     return { setName: setName || null, hosts };
   }
 
+  // Pure. VERIFIED BUG (Task 12, real 8.0.21 sharded cluster - the first time
+  // the indirect path ever met a real mongos): `listShards` reports each shard's
+  // members using the spelling the shard was REGISTERED with, while $collStats
+  // and $indexStats tag every document with the mongod's OWN idea of its address.
+  // Those two are routinely different - a cluster added as
+  // "shardA/127.0.0.1:27031,127.0.0.1:27032" answers with
+  // host "mongo-host-01:27031" - and comparing them by string equality marked
+  // EVERY member of every indirect shard unreachable, which silently discarded
+  // the entire payload (see collectSharded's indirect branch for the damage).
+  //
+  // Map an observed host back to the configured member it must be: an exact
+  // match first, then - only when the shard's configured hosts use DISTINCT
+  // ports, which makes the port a unique member identifier within that shard -
+  // a port match. Atlas-style shards, where every member listens on 27017,
+  // never reach the port branch: there it is the hostnames that differ and they
+  // already match exactly. Anything unmatched is returned UNCHANGED, so the
+  // caller can record it as a member in its own right rather than throwing its
+  // evidence away - erring toward an extra, honestly-labelled member entry and
+  // partial coverage, never toward silent data loss.
+  function canonicalObservedHost(observed, configuredHosts) {
+    const hosts = configuredHosts ?? [];
+    if (typeof observed !== 'string' || observed.length === 0) return observed;
+    if (hosts.includes(observed)) return observed;
+    const colon = observed.lastIndexOf(':');
+    if (colon === -1) return observed;
+    const port = observed.slice(colon + 1);
+    const samePort = hosts.filter((h) =>
+      typeof h === 'string' && h.lastIndexOf(':') !== -1
+      && h.slice(h.lastIndexOf(':') + 1) === port);
+    return samePort.length === 1 ? samePort[0] : observed;
+  }
+
+  // Pure. VERIFIED BUG (Task 12, same run): `probeCapabilities` answers "can
+  // this shell open another connection?" by opening ONE connection built from
+  // URI_TEMPLATE and `deriveSeedHost`. On a replica set that seed is a real
+  // member out of rs.conf, so the conflation is sound. On a mongos it is the
+  // ROUTER's own serverStatus().host - a host this run never connects to, and
+  // frequently not even resolvable from the client: reached over
+  // "mongodb://127.0.0.1:27030" a real mongos self-reported a bare hostname
+  // that failed with getaddrinfo ENOTFOUND, so canOpenConnections came back
+  // false and EVERY shard was downgraded to indirect collection even though
+  // `new Mongo('mongodb://127.0.0.1:27031/?directConnection=true')` succeeded
+  // from that very shell. collectSharded already probes each shard against that
+  // SHARD's own host and falls back per shard, so the only capability that may
+  // gate it is whether a Mongo constructor exists at all. A router probe that
+  // failed on the URI (template-failed) says nothing about the shards; no
+  // constructor at all, or a template with no {host} to substitute, still does.
+  function canProbeShardsDirectly(caps) {
+    if (!caps) return false;
+    return Boolean(caps.canOpenConnections)
+      || caps.connectionBlockedReason === 'template-failed';
+  }
+
   // Enumerates the cluster's shards from a mongos. Deliberately does NOT
   // catch: unlike `discoverMembers`, where "no replication configured" is a
   // legitimate standalone, there is no safe degraded reading of a failed
@@ -571,16 +624,40 @@
           + `${names.length} shard(s) reported as unobserved`);
       }
       const observedByShard = viaMongos ? viaMongos.observedByShard : {};
-      if (viaMongos) nodeResults.push(...viaMongos.nodeResults);
+      const hostsOfShard = new Map(indirect.map((s) => [s.name, s.hosts ?? []]));
+      // VERIFIED BUG (Task 12, real cluster): the hosts $collStats/$indexStats
+      // name are the mongods' own addresses, not the spellings listShards
+      // registered, so every identity below - the member entries, the shard's
+      // observedHosts, and the nodeResult key mergeNodes looks members up by -
+      // has to be canonicalised onto the configured set first. Without this the
+      // router was queried successfully and then EVERY index came back with an
+      // empty key, zero ops, zero bytes, no redundancy finding and no schema
+      // check, because mergeNodes walks `reachable` members and not one member
+      // matched a nodeResult host.
+      if (viaMongos) {
+        for (const node of viaMongos.nodeResults) {
+          node.host = canonicalObservedHost(node.host, hostsOfShard.get(node.shard));
+        }
+        nodeResults.push(...viaMongos.nodeResults);
+      }
       for (const shard of indirect) {
         const seen = observedByShard[shard.name] ?? { hosts: [], unattributed: false };
+        const observed = seen.hosts.map((h) => canonicalObservedHost(h, shard.hosts));
+        // True when any host had to be inferred onto a configured member by
+        // port rather than matched outright, or could not be placed at all.
+        // buildShardRecord refuses to call such a shard fully covered: the
+        // identification is sound, but a droppable verdict must never rest on
+        // an inference about WHICH member answered.
+        const inferredHosts = observed.some((h, i) =>
+          h !== seen.hosts[i] || !shard.hosts.includes(h));
         shardRecords.push(buildShardRecord(shard, {
           mode: 'indirect',
           expectedHosts: shard.hosts,
-          observedHosts: seen.hosts,
+          observedHosts: observed,
           readPref,
           error: mongosError,
           unattributed: seen.unattributed,
+          inferredHosts,
         }));
         // Every configured member of an indirect shard becomes a member entry:
         // the ones mongos routed to are reachable, the rest are explicitly
@@ -590,11 +667,26 @@
           members.push({
             id: null, host, shard: shard.name, role: 'unknown', hidden: false,
             delaySecs: 0, votes: 1,
-            reachable: seen.hosts.includes(host),
-            error: seen.hosts.includes(host) ? null
+            reachable: observed.includes(host),
+            error: observed.includes(host) ? null
               : (mongosError
                 ? `not observed - collection through mongos failed (${mongosError})`
                 : `not observed - routed through mongos with readPreference ${readPref}`),
+          });
+        }
+        // A host that answered but matched no configured member still has to
+        // appear, or its evidence is dropped on the floor exactly as it was
+        // before canonicalObservedHost existed. It is listed as its own member
+        // rather than merged into a configured one, because when the match is
+        // ambiguous we genuinely do not know WHICH member replied - and the
+        // shard's coverage stays 'partial' either way, so no droppable verdict
+        // can ride on the ambiguity.
+        for (const host of observed) {
+          if (shard.hosts.includes(host)) continue;
+          members.push({
+            id: null, host, shard: shard.name, role: 'unknown', hidden: false,
+            delaySecs: 0, votes: 1, reachable: true,
+            error: null,
           });
         }
       }
@@ -699,8 +791,18 @@
     let coverage;
     if (observedHosts.length === 0) {
       coverage = 'none';
-    } else if (opts.error || opts.unattributed || expectedHosts.length === 0
+    } else if (opts.error || opts.unattributed || opts.inferredHosts
+               || expectedHosts.length === 0
                || !expectedHosts.every((h) => observedHosts.includes(h))) {
+      // `inferredHosts` says at least one observed host was reconciled onto a
+      // configured member by something weaker than string equality - the port
+      // inference in canonicalObservedHost - or could not be reconciled at all.
+      // The inference is sound (within one shard, a member that answered on a
+      // port only one configured member uses IS that member), but "full
+      // coverage" is the single fact that unlocks a droppable verdict, so it is
+      // never allowed to rest on an inference. Exact-match reconciliation -
+      // the Atlas shape, and every direct run - does not set this flag and is
+      // unaffected.
       coverage = 'partial';
     } else {
       coverage = 'full';
@@ -1483,6 +1585,14 @@
     let nodeResults;
     let shardRecords;
     let fanOut;
+    // What meta reports as this shell's connection capability. It starts as the
+    // probe's prediction and is replaced by the observed fact on the sharded
+    // path, where the probe deliberately does not get the last word (see
+    // canProbeShardsDirectly). A local, assigned once, rather than a late
+    // mutation of `caps`: every other reader of `caps` wants the probe's own
+    // result, and rewriting it underneath them would be a side effect nobody
+    // looking at probeCapabilities would expect.
+    let openedConnections = caps.canOpenConnections;
     // Hoisted only so the sampling block below can still reach it; the
     // non-sharded path assigns and uses it exactly as it always has.
     let connFor;
@@ -1499,12 +1609,20 @@
         conn: db.getMongo(), config, shards,
         MongoCtor: typeof Mongo === 'function' ? Mongo
           : function () { throw new Error('no Mongo'); },
-        canOpenConnections: caps.canOpenConnections,
+        // NOT caps.canOpenConnections: that probe targeted the ROUTER's own
+        // address, which this run never connects to and which a real mongos
+        // routinely reports in a form the client cannot resolve. See
+        // canProbeShardsDirectly for the verified failure.
+        canOpenConnections: canProbeShardsDirectly(caps),
         readPref, printFn: print,
       });
       members = collected.members;
       nodeResults = collected.nodeResults;
       shardRecords = collected.shardRecords;
+      // Report what actually happened rather than what the router probe
+      // predicted: a shard collected directly is proof this shell can open
+      // connections, whatever the probe against the router's own address said.
+      openedConnections = openedConnections || shardRecords.some((s) => s.mode === 'direct');
       // A sharded run reaches every shard - directly where the probe succeeded,
       // through mongos otherwise - so it is never the degraded single-connection
       // case the peer-payload workflow exists to rescue.
@@ -1598,7 +1716,7 @@
       mode: fanOut ? discovered.mode : 'single-node',
       capabilities: {
         canWriteFiles: caps.canWriteFiles,
-        canOpenConnections: caps.canOpenConnections,
+        canOpenConnections: openedConnections,
       },
       config: { DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, INCLUDE_HIDDEN, MAX_TIME_MS },
     };
@@ -2191,7 +2309,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, canonicalObservedHost, canProbeShardsDirectly, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
