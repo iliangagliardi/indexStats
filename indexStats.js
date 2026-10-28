@@ -137,6 +137,33 @@
     return { host: 'unidentified-seed', synthetic: true };
   }
 
+  // Pure: classify the deployment from a raw `hello` document. A mongos
+  // identifies itself with msg: 'isdbgrid'; a replica-set member always
+  // reports its setName. Anything else is a standalone. Defensive about a
+  // missing document so a privilege-stripped hello can never throw here.
+  function detectTopology(hello) {
+    if (!hello || typeof hello !== 'object') return 'standalone';
+    if (hello.msg === 'isdbgrid') return 'sharded';
+    if (hello.setName) return 'replica-set';
+    return 'standalone';
+  }
+
+  // Pure: `listShards` reports each shard's members as a single string,
+  // "shardName/h1:27017,h2:27017" for a replica-set shard or a bare
+  // "h1:27017" for a single-host one. This is the ONLY way to learn a
+  // shard's members from a mongos - replSetGetConfig does not exist there -
+  // so parsing it is what makes the whole sharded path possible.
+  function parseShardHost(hostString) {
+    const raw = typeof hostString === 'string' ? hostString : '';
+    const slash = raw.indexOf('/');
+    const setName = slash === -1 ? null : raw.slice(0, slash);
+    const hostPart = slash === -1 ? raw : raw.slice(slash + 1);
+    const hosts = hostPart.split(',')
+      .map((h) => h.trim())
+      .filter((h) => h.length > 0);
+    return { setName: setName || null, hosts };
+  }
+
   function discoverMembers(adminDb, config) {
     const hello = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
     if (hello.msg === 'isdbgrid') {
@@ -1479,7 +1506,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
