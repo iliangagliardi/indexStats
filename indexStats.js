@@ -46,7 +46,7 @@
   // ----------------------------- configuration -----------------------------
   const EXCLUDED_DBS = new Set(['admin', 'config', 'local']);
   const MAX_TIME_MS = 30000; // per server call
-  const SCRIPT_VERSION = '3.0.0';
+  const SCRIPT_VERSION = '3.1.0';
   // WARNING: this template holds a credentials placeholder ("user:pass") - do
   // not commit this file with a real password filled in. Override at runtime
   // via the INDEXSTATS_URI environment variable instead of editing in place.
@@ -188,12 +188,21 @@
     }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
   }
 
+  // Pure: the hybrid decision itself. A shard whose members accept a direct
+  // connection is collected member by member, for full coverage; anything else
+  // - Atlas refusing direct shard access, a firewall, wrong credentials in
+  // URI_TEMPLATE, or a shell that cannot open connections at all - falls back
+  // to collection through the mongos, with the reduced coverage that implies.
+  function selectShardMode(probeResult) {
+    return probeResult && probeResult.ok ? 'direct' : 'indirect';
+  }
+
+  // No mongos guard here any more: main() classifies the deployment with
+  // detectTopology before it decides which collection path to take, so this
+  // function is only ever handed a replica-set member or a standalone - and on
+  // a sharded cluster it is reused, unchanged, to enumerate each shard's own
+  // replica set from a direct connection to one of its members.
   function discoverMembers(adminDb, config) {
-    const hello = adminDb.runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
-    if (hello.msg === 'isdbgrid') {
-      throw new Error('connected to a mongos: sharded clusters are not supported, because '
-        + 'rs.conf() does not exist there - connect to a member of one shard instead');
-    }
     let rsConfig = null;
     try {
       rsConfig = adminDb.runCommand({ replSetGetConfig: 1, maxTimeMS: config.MAX_TIME_MS }).config;
@@ -424,6 +433,120 @@
       host: node.host ?? `${node.shard}/unobserved`,
     }));
     return { nodeResults, observedByShard };
+  }
+
+  // Live-layer orchestration of the hybrid strategy, one decision per shard.
+  // Kept deliberately thin: every judgement it makes comes from a pure,
+  // separately tested function, because this glue layer is where every real
+  // bug in this project has been found. MongoCtor and printFn are arguments,
+  // never the ambient `Mongo`/`print`, so the whole thing stays testable.
+  function collectSharded({ conn, config, shards, MongoCtor, canOpenConnections,
+                            readPref, printFn }) {
+    const members = [];
+    const nodeResults = [];
+    const shardRecords = [];
+    const indirect = [];
+
+    for (const shard of shards) {
+      const probe = { ok: false, error: 'connections not available' };
+      if (canOpenConnections && shard.hosts.length) {
+        try {
+          new MongoCtor(uriFor(config.URI_TEMPLATE, shard.hosts[0]));
+          probe.ok = true;
+          probe.error = null;
+        } catch (e) {
+          probe.error = e && e.message ? e.message : String(e);
+        }
+      }
+
+      if (selectShardMode(probe) === 'indirect') {
+        indirect.push(shard);
+        printFn(`shard ${shard.name}: collecting through mongos (${probe.error})`);
+        continue;
+      }
+
+      // Direct: each shard is an ordinary replica set, so reuse the existing,
+      // unchanged fan-out wholesale.
+      const observed = [];
+      const shardMembers = [];
+      let shardError = null;
+      try {
+        const seedConn = new MongoCtor(uriFor(config.URI_TEMPLATE, shard.hosts[0]));
+        const discovered = discoverMembers(seedConn.getDB('admin'), config);
+        for (const member of discovered.members) {
+          member.shard = shard.name;
+          shardMembers.push(member);
+          try {
+            const memberConn = new MongoCtor(uriFor(config.URI_TEMPLATE, member.host));
+            const hello = memberConn.getDB('admin')
+              .runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+            member.role = (hello.isWritablePrimary || hello.ismaster) ? 'primary' : 'secondary';
+            member.reachable = true;
+            const collected = collectFromNode(memberConn, config, member.host);
+            collected.shard = shard.name;
+            nodeResults.push(collected);
+            observed.push(member.host);
+          } catch (e) {
+            member.reachable = false;
+            member.error = e.codeName ?? e.message;
+            printFn(`shard ${shard.name} member ${member.host} unreachable: ${member.error}`);
+          }
+        }
+        for (const excluded of discovered.excludedByConfig ?? []) {
+          excluded.shard = shard.name;
+          shardMembers.push(excluded);
+        }
+      } catch (e) {
+        shardError = e.codeName ?? e.message;
+        printFn(`shard ${shard.name}: direct collection failed (${shardError})`);
+      }
+
+      members.push(...shardMembers);
+      shardRecords.push(buildShardRecord(shard, {
+        mode: 'direct',
+        // Every data-bearing member of the shard, reachable or not, including
+        // the hidden ones INCLUDE_HIDDEN=false excluded: that full set is what
+        // "full coverage" has to be measured against. shardMembers cannot
+        // contain duplicates - each configured member is pushed exactly once.
+        expectedHosts: shardMembers.map((m) => m.host),
+        observedHosts: observed,
+        readPref: 'secondaryPreferred',
+        error: shardError,
+        unattributed: false,
+      }));
+    }
+
+    if (indirect.length) {
+      const names = indirect.map((s) => s.name);
+      const viaMongos = collectFromMongos(conn, config, names);
+      nodeResults.push(...viaMongos.nodeResults);
+      for (const shard of indirect) {
+        const seen = viaMongos.observedByShard[shard.name] ?? { hosts: [], unattributed: false };
+        shardRecords.push(buildShardRecord(shard, {
+          mode: 'indirect',
+          expectedHosts: shard.hosts,
+          observedHosts: seen.hosts,
+          readPref,
+          error: null,
+          unattributed: seen.unattributed,
+        }));
+        // Every configured member of an indirect shard becomes a member entry:
+        // the ones mongos routed to are reachable, the rest are explicitly
+        // unreachable. That is what lets the existing coverage gates see the
+        // hole instead of silently assuming the shard was fully observed.
+        for (const host of shard.hosts) {
+          members.push({
+            id: null, host, shard: shard.name, role: 'unknown', hidden: false,
+            delaySecs: 0, votes: 1,
+            reachable: seen.hosts.includes(host),
+            error: seen.hosts.includes(host) ? null
+              : `not observed - routed through mongos with readPreference ${readPref}`,
+          });
+        }
+      }
+    }
+
+    return { members, nodeResults, shardRecords };
   }
   // --------------------------------------------------------------------------
 
@@ -1265,6 +1388,24 @@
     };
     const seed = deriveSeedHost(db.getSiblingDB('admin'), db, config);
     config.SEED_HOST = seed.host;
+    const helloDoc = (function () {
+      try {
+        return db.getSiblingDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+      } catch (e) {
+        return null;
+      }
+    })();
+    const topology = detectTopology(helloDoc);
+    // Whatever read preference the user's own connection carries is what the
+    // indirect path actually observes. Report it; never override it.
+    const readPref = (function () {
+      try {
+        const rp = db.getMongo().getReadPrefMode();
+        return rp || 'primary';
+      } catch (e) {
+        return 'primary';
+      }
+    })();
     const caps = probeCapabilities({
       requireFn: typeof require === 'function' ? require
         : () => { throw new Error('no require'); },
@@ -1275,66 +1416,120 @@
     });
 
     let discovered;
-    try {
-      discovered = discoverMembers(db.getSiblingDB('admin'), config);
-    } catch (e) {
-      print(`FATAL: ${e.message}`);
-      return;
-    }
+    let members;
+    let nodeResults;
+    let shardRecords;
+    let fanOut;
+    // Hoisted only so the sampling block below can still reach it; the
+    // non-sharded path assigns and uses it exactly as it always has.
+    let connFor;
 
-    const fanOut = caps.canOpenConnections && discovered.mode === 'multi-node';
-    const connFor = (host) => (fanOut ? new Mongo(uriFor(config.URI_TEMPLATE, host)) : db.getMongo());
-
-    // Verified bug (Task 11, real cluster): when !fanOut, connFor ignores its `host`
-    // argument entirely (every call returns the one local connection), but the loop
-    // below used to iterate discovered.members in rs.config order and `break` after
-    // the first - so it always attributed the local, actually-reachable connection
-    // to whichever member happens to sort first in rs.config, not to the member the
-    // script is actually running on. Running this exact degraded path directly on a
-    // secondary (127.0.0.1:27022) produced a payload claiming host 127.0.0.1:27021 -
-    // a different, potentially genuinely-unreachable member - was the one reachable.
-    // Fixed by extracting the selection into the pure, tested selectCollectionTargets.
-    const targets = selectCollectionTargets(discovered.members, config.SEED_HOST, fanOut);
-
-    const nodeResults = [];
-    for (const member of targets) {
+    if (topology === 'sharded') {
+      let shards;
       try {
-        const conn = connFor(member.host);
-        const hello = conn.getDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
-        member.role = (hello.isWritablePrimary || hello.ismaster) ? 'primary' : 'secondary';
-        member.reachable = true;
-        nodeResults.push(collectFromNode(conn, config, member.host));
+        shards = discoverShards(db.getSiblingDB('admin'), config);
       } catch (e) {
-        member.reachable = false;
-        member.error = e.codeName ?? e.message;
-        print(`member ${member.host} unreachable: ${member.error}`);
+        print(`FATAL: ${e.message}`);
+        return;
       }
-      if (!fanOut) break;
+      const collected = collectSharded({
+        conn: db.getMongo(), config, shards,
+        MongoCtor: typeof Mongo === 'function' ? Mongo
+          : function () { throw new Error('no Mongo'); },
+        canOpenConnections: caps.canOpenConnections,
+        readPref, printFn: print,
+      });
+      members = collected.members;
+      nodeResults = collected.nodeResults;
+      shardRecords = collected.shardRecords;
+      // A sharded run reaches every shard - directly where the probe succeeded,
+      // through mongos otherwise - so it is never the degraded single-connection
+      // case the peer-payload workflow exists to rescue.
+      fanOut = true;
+      discovered = { replicaSetName: 'sharded cluster', mode: 'multi-node',
+                     members, excludedByConfig: [] };
+    } else {
+      try {
+        discovered = discoverMembers(db.getSiblingDB('admin'), config);
+      } catch (e) {
+        print(`FATAL: ${e.message}`);
+        return;
+      }
+
+      fanOut = caps.canOpenConnections && discovered.mode === 'multi-node';
+      connFor = (host) => (fanOut ? new Mongo(uriFor(config.URI_TEMPLATE, host)) : db.getMongo());
+
+      // Verified bug (Task 11, real cluster): when !fanOut, connFor ignores its `host`
+      // argument entirely (every call returns the one local connection), but the loop
+      // below used to iterate discovered.members in rs.config order and `break` after
+      // the first - so it always attributed the local, actually-reachable connection
+      // to whichever member happens to sort first in rs.config, not to the member the
+      // script is actually running on. Running this exact degraded path directly on a
+      // secondary (127.0.0.1:27022) produced a payload claiming host 127.0.0.1:27021 -
+      // a different, potentially genuinely-unreachable member - was the one reachable.
+      // Fixed by extracting the selection into the pure, tested selectCollectionTargets.
+      const targets = selectCollectionTargets(discovered.members, config.SEED_HOST, fanOut);
+
+      nodeResults = [];
+      for (const member of targets) {
+        try {
+          const conn = connFor(member.host);
+          const hello = conn.getDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+          member.role = (hello.isWritablePrimary || hello.ismaster) ? 'primary' : 'secondary';
+          member.reachable = true;
+          nodeResults.push(collectFromNode(conn, config, member.host));
+        } catch (e) {
+          member.reachable = false;
+          member.error = e.codeName ?? e.message;
+          print(`member ${member.host} unreachable: ${member.error}`);
+        }
+        if (!fanOut) break;
+      }
+
+      // FINDING 4: members excluded by INCLUDE_HIDDEN=false never got connected
+      // to (discovered.members already omits them, so they were never targets
+      // above) but must still show up as a gap, not vanish from the report.
+      members = [...discovered.members, ...(discovered.excludedByConfig ?? [])];
+      shardRecords = [];
     }
 
     const samples = [];
-    const sampleMember = pickSampleMember(discovered.members);
-    if (sampleMember) {
-      try {
-        const sampleConn = connFor(sampleMember.host);
-        const namespaces = (nodeResults.find((r) => r.host === sampleMember.host)
-          ?? nodeResults[0])?.namespaces ?? [];
-        for (const ns of namespaces) samples.push(sampleNamespace(sampleConn, ns, config, sampleMember.host));
-      } catch (e) {
-        print(`sampling skipped: ${e.codeName ?? e.message}`);
+    if (topology === 'sharded') {
+      // One connection, and mongos routes the sampling reads itself. The
+      // sample member is recorded as 'mongos' rather than a host, because
+      // that is literally what was asked - claiming a member here would be
+      // inventing evidence about which node the documents came from.
+      const sampledNamespaces = [];
+      for (const r of nodeResults) {
+        for (const ns of r.namespaces) {
+          if (!sampledNamespaces.includes(ns)) sampledNamespaces.push(ns);
+        }
+      }
+      for (const ns of sampledNamespaces) {
+        samples.push(sampleNamespace(db.getMongo(), ns, config, 'mongos'));
+      }
+    } else {
+      const sampleMember = pickSampleMember(discovered.members);
+      if (sampleMember) {
+        try {
+          const sampleConn = connFor(sampleMember.host);
+          const namespaces = (nodeResults.find((r) => r.host === sampleMember.host)
+            ?? nodeResults[0])?.namespaces ?? [];
+          for (const ns of namespaces) samples.push(sampleNamespace(sampleConn, ns, config, sampleMember.host));
+        } catch (e) {
+          print(`sampling skipped: ${e.codeName ?? e.message}`);
+        }
       }
     }
 
-    // FINDING 4: members excluded by INCLUDE_HIDDEN=false never got connected
-    // to (discovered.members already omits them, so they were never targets
-    // above) but must still show up as a gap, not vanish from the report.
     const merged = mergeNodes({
-      members: [...discovered.members, ...(discovered.excludedByConfig ?? [])],
-      nodeResults, samples, now: new Date(),
+      members, nodeResults, samples, now: new Date(), shards: shardRecords,
     });
     merged.meta = {
       generatedAt: new Date().toISOString(),
       scriptVersion: SCRIPT_VERSION,
+      topology,
+      readPref,
       replicaSetName: discovered.replicaSetName,
       seedHost: config.SEED_HOST,
       mode: fanOut ? discovered.mode : 'single-node',
@@ -1933,7 +2128,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

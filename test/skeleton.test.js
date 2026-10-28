@@ -7,7 +7,7 @@ test('requiring the script under node does not execute the shell run', () => {
 });
 
 test('exports the script version', () => {
-  assert.equal(S.SCRIPT_VERSION, '3.0.0');
+  assert.equal(S.SCRIPT_VERSION, '3.1.0');
 });
 
 test('exports isPlain as a pure function', () => {

@@ -110,8 +110,16 @@ function fakeAdmin(rsConfig, helloMsg) {
   };
 }
 
-test('refuses to run against a mongos', () => {
-  assert.throws(() => discoverMembers(fakeAdmin(null, 'isdbgrid'), CONFIG), /sharded/i);
+// discoverMembers used to refuse a mongos outright. main() now routes on
+// detectTopology before it ever gets here, so the refusal is gone and the
+// function must simply do its ordinary job on whatever it is handed.
+test('discoverMembers no longer refuses a mongos - main() routes on detectTopology first', () => {
+  const { members, replicaSetName } = discoverMembers(fakeAdmin({
+    _id: 'rs0',
+    members: [{ _id: 0, host: 'h1:27017' }],
+  }, 'isdbgrid'), CONFIG);
+  assert.equal(replicaSetName, 'rs0');
+  assert.deepEqual(members.map((m) => m.host), ['h1:27017']);
 });
 
 test('drops arbiters and keeps hidden members', () => {
@@ -448,4 +456,47 @@ test('collectFromMongos keeps a shard that returned nothing, with no observed ho
   });
   const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA', 'shardB']);
   assert.deepEqual(out.observedByShard.shardB.hosts, []);
+});
+
+const { collectSharded } = require('../indexStats.js');
+
+test('collectSharded uses mongos for every shard when no direct connection can be opened', () => {
+  const conn = fakeMongos({
+    dbs: ['shop'], colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 10 } } }] },
+    indexStats: { 'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', name: '_id_', key: { _id: 1 },
+        accesses: { ops: 0, since: SINCE } }] },
+  });
+  const out = collectSharded({
+    conn, config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'], state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'primary', printFn() {},
+  });
+  assert.equal(out.shardRecords[0].mode, 'indirect');
+  assert.equal(out.shardRecords[0].coverage, 'partial');
+  assert.deepEqual(out.shardRecords[0].observedHosts, ['h1:27017']);
+  // The member mongos never routed to must appear as unreachable, so the
+  // existing coverage gates can see the hole.
+  const unseen = out.members.find((m) => m.host === 'h2:27017');
+  assert.equal(unseen.reachable, false);
+  assert.equal(unseen.shard, 'shardA');
+});
+
+test('collectSharded marks every member of an indirect shard with its shard name', () => {
+  const conn = fakeMongos({
+    dbs: ['shop'], colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', storageStats: { indexSizes: { _id_: 10 } } }] },
+    indexStats: {},
+  });
+  const out = collectSharded({
+    conn, config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'], state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'primary', printFn() {},
+  });
+  for (const m of out.members) assert.equal(m.shard, 'shardA');
 });

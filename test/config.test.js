@@ -9,8 +9,8 @@ const api = require('../indexStats.js');
 // default landing in indexStats.js itself. This file is the only thing that
 // pins what actually ships.
 
-test('SCRIPT_VERSION is 3.0.0', () => {
-  assert.equal(api.SCRIPT_VERSION, '3.0.0');
+test('SCRIPT_VERSION is 3.1.0', () => {
+  assert.equal(api.SCRIPT_VERSION, '3.1.0');
 });
 
 test('DROP_MIN_COUNTER_DAYS is 14 (two-week safety threshold)', () => {
