@@ -338,3 +338,111 @@ test('selectIndexes with shard "all" or no shard key keeps every index', () => {
   assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'all' }).length, 1);
   assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1 }).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// FINDING 5 (final whole-branch review, minor but user-visible): countFor built
+// its state with no `shard` key, so the filter chips always counted
+// cluster-wide while the cards and the table respected STATE.shard - select one
+// shard and a chip read "drop 7" beside a card reading "drop candidates 3".
+//
+// countFor only exists inside CLIENT_BOOTSTRAP, as text. Lift the real source
+// out of the rendered page and run it, rather than asserting on a substring:
+// that way the test exercises exactly what ships in the browser.
+
+const { esc } = require('../indexStats.js');
+
+function clientCountFor(state) {
+  const html = renderHTML(payload());
+  const src = html.match(/function countFor\(f\)\{[\s\S]*?\.length;\}/);
+  assert.ok(src, 'countFor must be present in the rendered page');
+  // ES5 only - this is stringified into a page with no transpiler.
+  assert.equal(/=>|`/.test(src[0]), false, 'countFor must stay ES5-compatible');
+  const DATA = {
+    indexes: [
+      { ns: 'shop.orders', name: 'a_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardA' }] },
+      { ns: 'shop.orders', name: 'b_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardB' }] },
+      { ns: 'shop.orders', name: 'c_1', verdict: 'keep', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardB' }] },
+    ],
+  };
+  // eslint-disable-next-line no-new-func
+  return new Function('DATA', 'STATE', 'selectIndexes',
+    `${src[0]} return countFor;`)(DATA, state, selectIndexes);
+}
+
+test('the filter chips count within the selected shard', () => {
+  const countFor = clientCountFor({ shard: 'shardB' });
+  assert.equal(countFor('drop'), 1, 'only shardB has one drop candidate');
+  assert.equal(countFor('keep'), 1);
+  assert.equal(countFor('all'), 2);
+});
+
+test('the filter chips count cluster-wide when no shard is selected', () => {
+  const countFor = clientCountFor({ shard: 'all' });
+  assert.equal(countFor('drop'), 2);
+  assert.equal(countFor('all'), 3);
+});
+
+test('the chip count and the drop-candidates card agree for the selected shard', () => {
+  // The two numbers a reader sees side by side. They must come from the same
+  // selection, which is the whole point of threading STATE.shard through.
+  const state = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'shardB' };
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+      perShard: [{ shard: 'shardA' }] },
+    { ns: 'shop.orders', name: 'b_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+      perShard: [{ shard: 'shardB' }] },
+  ];
+  const card = summarise(selectIndexes(indexes, state)).drop;
+  const chip = selectIndexes(indexes, { ...state, filter: 'drop' }).length;
+  assert.equal(card, chip);
+  assert.equal(card, 1);
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 1 fallout: "index not present" and "never asked" are different facts.
+// On an indirect shard, mongos sends each namespace to one member, so a
+// member's siblings legitimately have no observation for that namespace - and
+// the per-member table must not report that as the index being absent.
+
+test('a member that was never asked about a namespace is not reported as missing the index', () => {
+  const html = renderHTML(payload());
+  const src = html.match(/function nodeRows\(i\)\{[\s\S]*?\n\}/);
+  assert.ok(src, 'nodeRows must be present in the rendered page');
+  assert.equal(/=>|`/.test(src[0]), false, 'nodeRows must stay ES5-compatible');
+  const nodeRows = new Function('h', 'fmtBytes', `${src[0]} return nodeRows;`)(esc, fmtBytes);
+
+  const rows = nodeRows({ perNode: [
+    { host: 'h1:27017', present: false, observed: true, error: null },
+    { host: 'h2:27017', present: false, observed: false, error: null },
+    { host: 'h3:27017', present: false, error: null }, // an older peer payload
+  ] });
+  assert.match(rows, /h1:27017<\/td><td colspan="4" class="muted">index not present/);
+  assert.match(rows, /h2:27017<\/td><td colspan="4" class="muted">not observed on this member/);
+  assert.match(rows, /h3:27017<\/td><td colspan="4" class="muted">index not present/);
+});
+
+// ---------------------------------------------------------------------------
+// The shard coverage panel has to say when a shard's evidence could not be
+// credited to one member, because such a host is deliberately NOT counted as
+// observed - leaving it unmentioned would make the row look like a plain
+// partial.
+
+test('the shard coverage panel names hosts whose evidence could not be attributed', () => {
+  const html = renderShardCoverage({ shards: [
+    { name: 'shardA', mode: 'indirect', coverage: 'partial', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017', 'h2:27017'], ambiguousHosts: ['h2:27017'],
+      readPref: 'nearest', error: null, draining: false },
+  ] });
+  assert.match(html, /evidence from h2:27017 could not be attributed to one member/);
+});
+
+test('the shard coverage panel is unchanged for a record with no ambiguous hosts', () => {
+  const html = renderShardCoverage({ shards: [
+    { name: 'shardA', mode: 'direct', coverage: 'full', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017'], readPref: 'primary', error: null, draining: false },
+  ] });
+  assert.equal(html.includes('could not be attributed'), false);
+});

@@ -1,18 +1,31 @@
 /**
  * indexStats.js (v3)
- * Replica-set-wide index usage, storage, redundancy and schema-consistency
- * report, rendered as a single self-contained HTML file.
+ * Cluster-wide index usage, storage, redundancy and schema-consistency
+ * report, rendered as a single self-contained HTML file. Runs against a
+ * standalone, a replica set, or a sharded cluster (point it at a mongos).
  *
  * Run:
  *   mongosh "<connection-string>" --quiet --file indexStats.js
  *
  * What it does:
- *   - discovers every member of the replica set (replSetGetConfig) and, when
- *     the shell can open extra connections (new Mongo(...)), fans out to each
- *     reachable member instead of reporting only the seed node
+ *   - classifies the deployment from hello() and takes the matching path:
+ *     - standalone or replica set: discovers every member (replSetGetConfig)
+ *       and, when the shell can open extra connections (new Mongo(...)), fans
+ *       out to each reachable member instead of reporting only the seed node
+ *     - sharded cluster: enumerates the shards (listShards), then collects
+ *       each shard one of two ways - DIRECTLY, opening its own connection to
+ *       every member of that shard's replica set exactly as above, which is
+ *       the only way to get full coverage; or INDIRECTLY through the mongos,
+ *       splitting the `shard` and `host` fields that $collStats/$indexStats
+ *       attach to every document back out per member. The choice is made per
+ *       shard, by probing that shard: one whose members refuse a direct
+ *       connection (Atlas, a firewall, credentials URI_TEMPLATE does not
+ *       carry) falls back to the mongos on its own, and the rest of the
+ *       cluster keeps its full coverage
  *   - per member: one $collStats aggregation (index sizes, WT fragmentation,
  *     WT cache bytes), one $indexStats aggregation (ops + counter start time),
- *     one getIndexes() - merged across members into one cluster-wide view
+ *     one getIndexes() - merged across members, and across shards, into one
+ *     cluster-wide view
  *   - samples documents ($sample) and reads collection validators on one
  *     reachable member (preferring a hidden member, to spare the primary) to
  *     flag indexes on fields that are rare, absent, or excluded by a strict
@@ -27,14 +40,22 @@
  *     was never observed for it at all - never a droppable verdict), rolled
  *     into an advisory verdict (drop / likely-drop / redundant / mismatched /
  *     inconclusive / keep)
+ *   - on a sharded cluster, records per-shard coverage ('full' / 'partial' /
+ *     'none') with the members observed and the read preference used, and
+ *     renders it as its own panel so "why is this inconclusive" is always
+ *     answered on the page
  *   - writes the report to OUT_FILE via require('fs') when the shell allows
  *     file access, otherwise prints the whole HTML document to the console
  *
  * Safety:
  *   - read-only: never mutates data, never drops anything - all output is advisory
  *   - views and system collections excluded up front
- *   - per-database, per-collection, per-member and per-namespace-sample error
- *     isolation (one bad namespace or unreachable member never kills the run)
+ *   - only a shard whose every data-bearing member was observed ('full'
+ *     coverage) can carry a droppable verdict, exactly as an unreachable
+ *     member blocks one on a replica set
+ *   - per-database, per-collection, per-member, per-shard and
+ *     per-namespace-sample error isolation (one bad namespace, unreachable
+ *     member or unreachable shard never kills the run)
  *   - maxTimeMS on every server call so a stalled node cannot hang the report,
  *     with one documented exception: mongosh's getCollectionInfos()/getIndexes()
  *     helpers accept no maxTimeMS parameter
@@ -63,7 +84,9 @@
 
   // ------------------------------ live layer --------------------------------
   // Talks to a real (or fake, in tests) MongoDB connection: capability probing,
-  // replica-set member discovery, and per-member collection of index metadata.
+  // topology detection, replica-set member discovery and shard enumeration,
+  // and per-member collection of index metadata - whether that member is
+  // reached directly or observed through a mongos.
 
   // FINDING 5 (final review, important): this used to probe with
   // `new MongoCtor(seedHost)` - a bare host, no credentials, no
@@ -107,6 +130,47 @@
       throw new Error('URI_TEMPLATE must contain {host}');
     }
     return String(template).split('{host}').join(host);
+  }
+
+  // FINDING 4 (final whole-branch review, important): MAX_TIME_MS bounds every
+  // server call but cannot bound `new Mongo(uri)` - only the driver's
+  // server-selection timeout does, and the shipped URI_TEMPLATE sets none. On
+  // exactly the deployment the sharded path targets - Atlas, or any firewalled
+  // cluster, where the per-shard probe MUST fail for the indirect design to
+  // engage - every shard burns that timeout in turn, sequentially, before
+  // falling back. Bind it explicitly on the PROBE rather than inheriting
+  // whatever the host shell happens to default to. The shipped template, and
+  // therefore every replica-set connection and every real per-member
+  // collection connection, is left exactly as the user wrote it, so
+  // replica-set timing is untouched.
+  //
+  // WHY 2000 AND NOT 30000 (measured 2026-10-28, mongosh 2.13.0, against a
+  // real sharded cluster plus a TCP listener that accepts and never replies -
+  // the only way to produce a genuine stall, since an unroutable address fails
+  // fast with ENETUNREACH instead): the Node driver's documented default IS
+  // 30s, but mongosh does NOT use it. With no option in the URI, mongosh's own
+  // probe failed with "Server selection timed out after 2000 ms". A 3000ms
+  // value - the obvious "short" choice - therefore made the probe SLOWER than
+  // doing nothing on this shell. 2000 matches what mongosh itself applies, and
+  // is the right bound on its own merits: if a shard cannot be selected inside
+  // it, the real collection connections built from the same template - which
+  // carry no timeout and so inherit the same shell default - would not have
+  // reached it either. The value earns its keep on a shell whose default is
+  // the driver's 30s (or none at all), where it is the difference between a
+  // bounded fallback and minutes of apparent hang.
+  const PROBE_SELECTION_TIMEOUT_MS = 2000;
+
+  // Pure. A template may already carry a query string ('...{host}/?directConnection=true'),
+  // may already set the option itself (in which case the user's value wins),
+  // or may have no path separator at all ('mongodb://{host}') - which needs a
+  // '/' inserted before any '?', or the URI is malformed.
+  function probeUriFor(template, host, timeoutMs) {
+    const uri = uriFor(template, host);
+    if (uri.includes('serverSelectionTimeoutMS=')) return uri;
+    if (uri.includes('?')) return `${uri}&serverSelectionTimeoutMS=${timeoutMs}`;
+    const schemeEnd = uri.indexOf('://');
+    const rest = schemeEnd === -1 ? uri : uri.slice(schemeEnd + 3);
+    return `${uri}${rest.includes('/') ? '' : '/'}?serverSelectionTimeoutMS=${timeoutMs}`;
   }
 
   // Verified against a live mongod (mongosh 2.9.2): `db.getMongo().host` is
@@ -194,6 +258,33 @@
       typeof h === 'string' && h.lastIndexOf(':') !== -1
       && h.slice(h.lastIndexOf(':') + 1) === port);
     return samePort.length === 1 ? samePort[0] : observed;
+  }
+
+  // Pure: reconcile EVERY host a shard's documents named onto that shard's
+  // configured member list in one go, and say whether anything weaker than
+  // string equality was needed.
+  //
+  // Doing it per shard rather than per host is what makes collisions visible.
+  // The indirect path now keys one node per (shard, host) - see
+  // collectFromMongos - so two distinct observed hosts inferred onto the SAME
+  // configured member would silently collapse two members' evidence under one
+  // key in mergeNodes' byHost map, losing one of them. When that happens the
+  // whole shard falls back to the hosts' own spellings: both nodes stay
+  // distinct, no evidence is lost, and `inferred` keeps the shard short of
+  // 'full' coverage so nothing droppable can rest on the ambiguity.
+  function reconcileShardHosts(observedHosts, configuredHosts) {
+    const hosts = observedHosts ?? [];
+    const configured = configuredHosts ?? [];
+    const mapped = hosts.map((h) => canonicalObservedHost(h, configured));
+    const collides = new Set(mapped).size !== mapped.length;
+    const map = {};
+    let inferred = collides;
+    hosts.forEach((h, i) => {
+      const canon = collides ? h : mapped[i];
+      map[h] = canon;
+      if (canon !== h || !configured.includes(canon)) inferred = true;
+    });
+    return { map, inferred };
   }
 
   // Pure. VERIFIED BUG (Task 12, same run): `probeCapabilities` answers "can
@@ -408,18 +499,55 @@
   // fiction.
   function collectFromMongos(conn, config, shardNames) {
     const excluded = new Set(config.EXCLUDED_DBS);
-    const byShard = new Map();
+    // FINDING 1 (final whole-branch review, CRITICAL): this used to model each
+    // shard as exactly ONE node, keyed by the first host it ever saw, while
+    // still accumulating EVERY host it saw into observedByShard. mongos routes
+    // each namespace's aggregation independently, so any read preference that
+    // can select more than one member per shard (secondaryPreferred, nearest)
+    // made those two disagree: one node ended up carrying namespaces that
+    // several different members had answered, every one of those hosts was
+    // then marked a reachable member off the back of that single node, and the
+    // shard could claim coverage 'full' - the one value that unlocks a drop -
+    // on one member's evidence, while the report credited each namespace to
+    // whichever member happened to answer first.
+    //
+    // Key nodes per (shard, host) instead. Each observed host gets its own
+    // node carrying only the namespaces it actually answered, exactly like a
+    // directly-collected replica-set member, so attribution, reachability and
+    // coverage are all derived from the same evidence - and secondaryPreferred
+    // genuinely widens coverage within one run, as the docs promise.
+    const nodesByShard = new Map();
     const observedByShard = {};
-    for (const name of shardNames ?? []) {
-      byShard.set(name, { host: null, shard: name, namespaces: [], collections: {}, skipped: [] });
-      observedByShard[name] = { hosts: [], unattributed: false };
-    }
-    const nodeFor = (shard) => {
-      if (!byShard.has(shard)) {
-        byShard.set(shard, { host: null, shard, namespaces: [], collections: {}, skipped: [] });
-        observedByShard[shard] = { hosts: [], unattributed: false };
+    // Router-level failures - a database that could not be listed, a namespace
+    // whose aggregation threw - belong to no single member, and a shard's
+    // hosts are not all known until the whole sweep is done. Collect them per
+    // shard and attach them to every one of that shard's nodes at the end.
+    const skippedByShard = new Map();
+    const shardSeen = (shard) => {
+      if (!nodesByShard.has(shard)) {
+        nodesByShard.set(shard, new Map());
+        skippedByShard.set(shard, []);
+        observedByShard[shard] = {
+          hosts: [], attributedHosts: [], ambiguousHosts: [],
+          unattributed: false, ambiguous: false,
+        };
       }
-      return byShard.get(shard);
+      return observedByShard[shard];
+    };
+    for (const name of shardNames ?? []) shardSeen(name);
+    // `host` is null when the documents carried no host field at all. The node
+    // still has to exist - its evidence is real - but it is keyed to a
+    // synthetic identity and kept out of attributedHosts, so it can never be
+    // reported as a reachable member.
+    const nodeFor = (shard, host) => {
+      const seen = shardSeen(shard);
+      const nodes = nodesByShard.get(shard);
+      const key = host ?? `${shard}/unattributed`;
+      if (!nodes.has(key)) {
+        nodes.set(key, { host: key, shard, namespaces: [], collections: {}, skipped: [] });
+        if (host && !seen.attributedHosts.includes(host)) seen.attributedHosts.push(host);
+      }
+      return nodes.get(key);
     };
 
     const dbNames = conn.getDB('admin')
@@ -436,9 +564,8 @@
           .getCollectionInfos({ type: 'collection' }, true)
           .map((c) => c.name).filter((n) => !n.startsWith('system.')).sort();
       } catch (e) {
-        for (const node of byShard.values()) {
-          node.skipped.push({ ns: dbName, reason: e.codeName ?? e.message });
-        }
+        const reason = e.codeName ?? e.message;
+        for (const list of skippedByShard.values()) list.push({ ns: dbName, reason });
         continue;
       }
 
@@ -456,21 +583,34 @@
           demuxed = demuxShardStats(collStatsDocs, indexStatsDocs);
         } catch (e) {
           const reason = e.codeName ?? e.message;
-          for (const node of byShard.values()) node.skipped.push({ ns, reason });
+          for (const list of skippedByShard.values()) list.push({ ns, reason });
           continue;
         }
 
         for (const [shard, data] of Object.entries(demuxed.byShard)) {
-          const node = nodeFor(shard);
-          // The shard's first answering host identifies its single node.
-          // Claiming one node per answering host would assert per-member
-          // evidence this path does not have.
-          if (!node.host && data.hosts.length) node.host = data.hosts[0];
-          const seen = observedByShard[shard];
+          const seen = shardSeen(shard);
           for (const h of data.hosts) {
             if (!seen.hosts.includes(h)) seen.hosts.push(h);
           }
           if (demuxed.unattributed) seen.unattributed = true;
+          // mongos routes one namespace's aggregation to one member, so a
+          // (shard, namespace) pair normally names exactly one host. When it
+          // does not - no host field at all, or $collStats and $indexStats
+          // answered by two DIFFERENT members of the same shard, which
+          // demuxShardStats has already blended into one entry - no single
+          // member can honestly be credited with the result. Throwing the
+          // entry away is the Task 12 blank-report bug, so keep it: attribute
+          // it to the first host for determinism, record the rest as
+          // ambiguous (they are observed, but they get no node and so can
+          // never be claimed as reachable members), and flag the shard so
+          // buildShardRecord can never call it fully covered.
+          if (data.hosts.length !== 1) {
+            seen.ambiguous = true;
+            for (const h of data.hosts.slice(1)) {
+              if (!seen.ambiguousHosts.includes(h)) seen.ambiguousHosts.push(h);
+            }
+          }
+          const node = nodeFor(shard, data.hosts.length ? data.hosts[0] : null);
           node.namespaces.push(ns);
           node.collections[ns] = {
             indexes: data.indexes, usage: data.usage, storage: data.storage, error: null,
@@ -479,12 +619,20 @@
       }
     }
 
-    const nodeResults = [...byShard.values()].map((node) => ({
-      ...node,
-      // A shard that answered nothing still needs a stable identity, or it
-      // would silently merge with another shard's entries downstream.
-      host: node.host ?? `${node.shard}/unobserved`,
-    }));
+    const nodeResults = [];
+    for (const [shard, nodes] of nodesByShard) {
+      // A shard that answered nothing still needs a stable identity: without
+      // one it would vanish from the payload and its skipped entries with it.
+      if (nodes.size === 0) {
+        const host = `${shard}/unobserved`;
+        nodes.set(host, { host, shard, namespaces: [], collections: {}, skipped: [] });
+      }
+      const shardSkips = skippedByShard.get(shard) ?? [];
+      for (const node of nodes.values()) {
+        node.skipped = node.skipped.concat(shardSkips);
+        nodeResults.push(node);
+      }
+    }
     return { nodeResults, observedByShard };
   }
 
@@ -504,7 +652,11 @@
       const probe = { ok: false, error: 'connections not available' };
       if (canOpenConnections && shard.hosts.length) {
         try {
-          new MongoCtor(uriFor(config.URI_TEMPLATE, shard.hosts[0]));
+          // Bounded: see probeUriFor. Only this throwaway probe connection
+          // gets the short server-selection timeout - the collection
+          // connections below use the user's template verbatim.
+          new MongoCtor(probeUriFor(config.URI_TEMPLATE, shard.hosts[0],
+            PROBE_SELECTION_TIMEOUT_MS));
           probe.ok = true;
           probe.error = null;
         } catch (e) {
@@ -624,7 +776,6 @@
           + `${names.length} shard(s) reported as unobserved`);
       }
       const observedByShard = viaMongos ? viaMongos.observedByShard : {};
-      const hostsOfShard = new Map(indirect.map((s) => [s.name, s.hosts ?? []]));
       // VERIFIED BUG (Task 12, real cluster): the hosts $collStats/$indexStats
       // name are the mongods' own addresses, not the spellings listShards
       // registered, so every identity below - the member entries, the shard's
@@ -634,30 +785,51 @@
       // empty key, zero ops, zero bytes, no redundancy finding and no schema
       // check, because mergeNodes walks `reachable` members and not one member
       // matched a nodeResult host.
+      //
+      // One reconciliation per shard, computed once from every host that
+      // shard's documents named, so the node keys, the shard's observedHosts
+      // and the member reachability flags cannot disagree about who answered -
+      // and so a collision between two inferred hosts is visible (finding 1
+      // made it possible for one shard to own several nodes).
+      const reconciled = new Map(indirect.map((s) => [s.name,
+        reconcileShardHosts((observedByShard[s.name] ?? {}).hosts, s.hosts)]));
       if (viaMongos) {
         for (const node of viaMongos.nodeResults) {
-          node.host = canonicalObservedHost(node.host, hostsOfShard.get(node.shard));
+          const r = reconciled.get(node.shard);
+          // Synthetic keys ('<shard>/unobserved', '<shard>/unattributed') are
+          // not in the map and must keep their own identity.
+          if (r && Object.prototype.hasOwnProperty.call(r.map, node.host)) {
+            node.host = r.map[node.host];
+          }
         }
         nodeResults.push(...viaMongos.nodeResults);
       }
       for (const shard of indirect) {
-        const seen = observedByShard[shard.name] ?? { hosts: [], unattributed: false };
-        const observed = seen.hosts.map((h) => canonicalObservedHost(h, shard.hosts));
-        // True when any host had to be inferred onto a configured member by
-        // port rather than matched outright, or could not be placed at all.
-        // buildShardRecord refuses to call such a shard fully covered: the
-        // identification is sound, but a droppable verdict must never rest on
-        // an inference about WHICH member answered.
-        const inferredHosts = observed.some((h, i) =>
-          h !== seen.hosts[i] || !shard.hosts.includes(h));
+        const seen = observedByShard[shard.name] ?? {};
+        const r = reconciled.get(shard.name) ?? { map: {}, inferred: false };
+        // A shard's observed members are exactly the hosts that have their own
+        // nodeResult - evidence of their own, not a sibling's. A host that
+        // answered but whose evidence could not be pinned to it alone is
+        // listed separately, informationally, and never counted as observed
+        // or marked reachable.
+        const observed = (seen.attributedHosts ?? []).map((h) => r.map[h] ?? h);
+        const ambiguousHosts = (seen.ambiguousHosts ?? [])
+          .map((h) => r.map[h] ?? h).filter((h) => !observed.includes(h));
         shardRecords.push(buildShardRecord(shard, {
           mode: 'indirect',
           expectedHosts: shard.hosts,
           observedHosts: observed,
           readPref,
           error: mongosError,
-          unattributed: seen.unattributed,
-          inferredHosts,
+          unattributed: Boolean(seen.unattributed),
+          // True when any host had to be inferred onto a configured member by
+          // port rather than matched outright, could not be placed at all, or
+          // supplied evidence no single member can be credited with.
+          // buildShardRecord refuses to call such a shard fully covered: the
+          // identification is sound, but a droppable verdict must never rest
+          // on an inference about WHICH member answered.
+          inferredHosts: r.inferred || Boolean(seen.ambiguous),
+          ambiguousHosts,
         }));
         // Every configured member of an indirect shard becomes a member entry:
         // the ones mongos routed to are reachable, the rest are explicitly
@@ -788,10 +960,15 @@
   function buildShardRecord(shard, opts) {
     const expectedHosts = opts.expectedHosts ?? [];
     const observedHosts = opts.observedHosts ?? [];
+    // Hosts that answered for this shard but whose evidence belongs to no one
+    // member - informational only, never counted as observed, never a
+    // reachable member, and on their own enough to deny 'full'.
+    const ambiguousHosts = opts.ambiguousHosts ?? [];
     let coverage;
     if (observedHosts.length === 0) {
       coverage = 'none';
     } else if (opts.error || opts.unattributed || opts.inferredHosts
+               || ambiguousHosts.length
                || expectedHosts.length === 0
                || !expectedHosts.every((h) => observedHosts.includes(h))) {
       // `inferredHosts` says at least one observed host was reconciled onto a
@@ -817,6 +994,7 @@
       coverage,
       expectedHosts,
       observedHosts,
+      ambiguousHosts,
       readPref: opts.readPref ?? 'primary',
       error: opts.error ?? null,
     };
@@ -974,7 +1152,16 @@
               if (skip) observationError = skip.reason;
             }
             perNode.push({ host: m.host, shard: shardOfHost.get(m.host) ?? null,
-                           present: false, ops: null, since: null,
+                           present: false,
+                           // Did this member demonstrably CHECK this namespace?
+                           // "absent" and "never looked at" are different
+                           // facts, and the report must not print the first
+                           // when it means the second - routinely the case on
+                           // an indirect shard, where mongos sends each
+                           // namespace to one member and its siblings were
+                           // simply never asked about this one.
+                           observed: Boolean(coll && !coll.error),
+                           ops: null, since: null,
                            counterAgeDays: null, sizeBytes: 0, reusableBytes: 0,
                            cacheBytes: 0, error: observationError });
             continue;
@@ -1255,10 +1442,20 @@
         out.gaps.skipped
           .filter((s) => s.ns === idx.ns || s.ns === dbNameOfNs)
           .map((s) => s.member));
+      // FINDING 2 (final whole-branch review, important): mergeNodes keeps
+      // "this shard does not host the collection" (notHosting) strictly apart
+      // from "this member is missing the index" (missingOn); this copy of the
+      // computation did not, so every member of a shard that never held the
+      // namespace was recomputed into missingOn on merge, flipping
+      // definition.consistent to false and the verdict to `mismatched` - a
+      // member being blamed for lacking an index it was never supposed to
+      // have. Carry the exclusion across, so the two computations agree.
+      const notHostingThisIdx = new Set(idx.definition.notHosting ?? []);
       const missingOn = out.members
         .filter((m) => m.reachable)
         .filter((m) => !present.some((n) => n.host === m.host))
         .filter((m) => !skippedThisNs.has(m.host))
+        .filter((m) => !notHostingThisIdx.has(m.host))
         .map((m) => m.host);
       idx.definition = {
         ...idx.definition,
@@ -2036,8 +2233,13 @@ var FILTERS = ['all','drop','likely-drop','redundant','inconclusive','mismatched
                'suspect-field','used-only-on-hidden'];
 function h(s){return String(s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function countFor(f){return f==='all'?DATA.indexes.length:
-  selectIndexes(DATA.indexes,{filter:f,search:'',sortKey:'size',sortDir:-1}).length;}
+/* The chips must count what the cards and the table show, so the shard
+   filter has to be threaded through here too - without it, selecting one
+   shard left every chip reading a cluster-wide total beside a card reading
+   the shard's own. Deliberately NOT STATE.filter: each chip counts its own
+   filter. ES5 only - this is stringified into the page. */
+function countFor(f){return selectIndexes(DATA.indexes,
+  {filter:f,search:'',sortKey:'size',sortDir:-1,shard:STATE.shard}).length;}
 function renderControls(){
   var html = FILTERS.filter(function(f){return f==='all'||countFor(f)>0;}).map(function(f){
     return '<button class="chip '+f+(STATE.filter===f?' on':'')+'" data-f="'+f+'">'+f+' '+countFor(f)+'</button>';
@@ -2079,7 +2281,9 @@ function drawCards(){
 }
 function nodeRows(i){
   return i.perNode.map(function(n){
-    if(!n.present) return '<tr><td class="mono">'+h(n.host)+'</td><td colspan="4" class="muted">index not present'+(n.error?' - '+h(n.error):'')+'</td></tr>';
+    if(!n.present) return '<tr><td class="mono">'+h(n.host)+'</td><td colspan="4" class="muted">'+
+      (n.observed===false?'not observed on this member':'index not present')+
+      (n.error?' - '+h(n.error):'')+'</td></tr>';
     return '<tr><td class="mono">'+h(n.host)+'</td><td class="num">'+n.ops+'</td><td class="num">'+
       (n.counterAgeDays===null?'-':n.counterAgeDays.toFixed(1)+' d')+'</td><td class="num">'+
       fmtBytes(n.sizeBytes)+'</td><td class="num">'+fmtBytes(n.reusableBytes)+'</td></tr>';
@@ -2249,9 +2453,18 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
           + observedHosts.map((h) => esc(h)).join(', ')
         : 'no members answered';
       const note = s.error ? ` - ${esc(s.error)}` : s.draining ? ' - draining' : '';
+      // Rare, but it must not be invisible: a host that answered for this
+      // shard whose evidence could not be credited to it alone (mongos sent
+      // $collStats and $indexStats for one namespace to two different
+      // members). It is not counted as observed, which is why it needs saying.
+      const ambiguous = s.ambiguousHosts ?? [];
+      const amb = ambiguous.length
+        ? ` - evidence from ${ambiguous.map((h) => esc(h)).join(', ')} could not be `
+          + 'attributed to one member'
+        : '';
       return `<tr><td class="mono">${esc(s.name)}</td><td>${how}</td>`
         + `<td><span class="tag ${esc(s.coverage)}">${esc(s.coverage)}</span></td>`
-        + `<td>${seen}${note}</td></tr>`;
+        + `<td>${seen}${amb}${note}</td></tr>`;
     }).join('');
     const partial = shards.filter((s) => s.coverage !== 'full').length;
     const note = partial
@@ -2309,7 +2522,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, canonicalObservedHost, canProbeShardsDirectly, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, canonicalObservedHost, reconcileShardHosts, probeUriFor, PROBE_SELECTION_TIMEOUT_MS, canProbeShardsDirectly, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

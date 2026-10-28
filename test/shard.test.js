@@ -353,3 +353,126 @@ test('canProbeShardsDirectly is false for a missing capability object rather tha
   assert.equal(canProbeShardsDirectly(null), false);
   assert.equal(canProbeShardsDirectly(undefined), false);
 });
+
+// ---------------------------------------------------------------------------
+// reconcileShardHosts - FINDING 1 (final whole-branch review, critical).
+// The indirect path now keys one node per (shard, host), so reconciliation has
+// to happen once per shard, over every host that shard's documents named: it
+// is the only place a collision between two inferred hosts can be seen.
+
+const { reconcileShardHosts } = require('../indexStats.js');
+
+test('reconcileShardHosts maps exact matches unchanged and reports no inference', () => {
+  const r = reconcileShardHosts(['h1:27017', 'h2:27017'], ['h1:27017', 'h2:27017', 'h3:27017']);
+  assert.deepEqual(r.map, { 'h1:27017': 'h1:27017', 'h2:27017': 'h2:27017' });
+  assert.equal(r.inferred, false);
+});
+
+test('reconcileShardHosts maps a differently-spelled host onto its unique port', () => {
+  const r = reconcileShardHosts(['mongo-01:27031'], ['127.0.0.1:27031', '127.0.0.1:27032']);
+  assert.deepEqual(r.map, { 'mongo-01:27031': '127.0.0.1:27031' });
+  assert.equal(r.inferred, true, 'a port inference must deny full coverage');
+});
+
+test('reconcileShardHosts flags a host it could not place at all', () => {
+  const r = reconcileShardHosts(['stranger:29999'], ['127.0.0.1:27031', '127.0.0.1:27032']);
+  assert.deepEqual(r.map, { 'stranger:29999': 'stranger:29999' });
+  assert.equal(r.inferred, true);
+});
+
+test('reconcileShardHosts keeps colliding hosts distinct rather than merging their evidence', () => {
+  // Two different observed hosts that would both infer onto 127.0.0.1:27031.
+  // Collapsing them would lose one member's evidence entirely in mergeNodes'
+  // byHost map, which keys one node per host.
+  const r = reconcileShardHosts(['mongo-01:27031', 'mongo-02:27031'],
+    ['127.0.0.1:27031', '127.0.0.1:27032']);
+  assert.deepEqual(r.map,
+    { 'mongo-01:27031': 'mongo-01:27031', 'mongo-02:27031': 'mongo-02:27031' });
+  assert.equal(r.inferred, true);
+  assert.equal(new Set(Object.values(r.map)).size, 2, 'both hosts stay distinct');
+});
+
+test('reconcileShardHosts tolerates missing input', () => {
+  assert.deepEqual(reconcileShardHosts(undefined, undefined), { map: {}, inferred: false });
+  assert.deepEqual(reconcileShardHosts([], ['h1:27017']), { map: {}, inferred: false });
+});
+
+// ---------------------------------------------------------------------------
+// buildShardRecord: ambiguous hosts (evidence no one member can be credited
+// with) are informational, never observed, and on their own deny 'full'.
+
+test('buildShardRecord never reports full coverage while any host is ambiguous', () => {
+  const rec = buildShardRecord({ name: 'shardA', hosts: ['h1:27017', 'h2:27017'] }, {
+    mode: 'indirect', expectedHosts: ['h1:27017', 'h2:27017'],
+    observedHosts: ['h1:27017', 'h2:27017'], ambiguousHosts: ['h3:27017'],
+    readPref: 'nearest',
+  });
+  assert.equal(rec.coverage, 'partial');
+  assert.deepEqual(rec.ambiguousHosts, ['h3:27017']);
+});
+
+test('buildShardRecord defaults ambiguousHosts to an empty list', () => {
+  const rec = buildShardRecord({ name: 'shardA', hosts: ['h1:27017'] }, {
+    mode: 'direct', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'],
+  });
+  assert.deepEqual(rec.ambiguousHosts, []);
+  assert.equal(rec.coverage, 'full');
+});
+
+// ---------------------------------------------------------------------------
+// probeUriFor - FINDING 4 (final whole-branch review, important). MAX_TIME_MS
+// cannot bound `new Mongo(uri)`; only the driver's server-selection timeout
+// can, and the shipped template sets none. The PROBE gets a short one; the
+// user's template is never rewritten for the real collection connections.
+
+const { probeUriFor, PROBE_SELECTION_TIMEOUT_MS, URI_TEMPLATE } = require('../indexStats.js');
+
+test('probeUriFor appends the timeout with & when the template already has a query string', () => {
+  assert.equal(
+    probeUriFor('mongodb://user:pass@{host}/?directConnection=true&appName=indexStats',
+      'h1:27017', 2000),
+    'mongodb://user:pass@h1:27017/?directConnection=true&appName=indexStats'
+      + '&serverSelectionTimeoutMS=2000');
+});
+
+test('probeUriFor inserts the missing path separator when the template has no query string', () => {
+  assert.equal(probeUriFor('mongodb://{host}', 'h1:27017', 2000),
+    'mongodb://h1:27017/?serverSelectionTimeoutMS=2000');
+});
+
+test('probeUriFor does not add a second slash when the template already ends in one', () => {
+  assert.equal(probeUriFor('mongodb://{host}/', 'h1:27017', 2000),
+    'mongodb://h1:27017/?serverSelectionTimeoutMS=2000');
+});
+
+test('probeUriFor leaves a template that already sets the timeout alone', () => {
+  const t = 'mongodb://{host}/?serverSelectionTimeoutMS=500';
+  assert.equal(probeUriFor(t, 'h1:27017', 2000), 'mongodb://h1:27017/?serverSelectionTimeoutMS=500');
+});
+
+test('probeUriFor still enforces the {host} placeholder', () => {
+  assert.throws(() => probeUriFor('mongodb://fixed:27017/', 'h1:27017', 2000),
+    /URI_TEMPLATE must contain \{host\}/);
+});
+
+test('probeUriFor applied to the shipped URI_TEMPLATE produces one well-formed query string', () => {
+  const uri = probeUriFor(URI_TEMPLATE, 'h1:27017', PROBE_SELECTION_TIMEOUT_MS);
+  assert.equal(uri.split('?').length, 2, 'exactly one question mark');
+  assert.match(uri, /&serverSelectionTimeoutMS=2000$/);
+});
+
+test('the probe timeout never makes the probe slower than the shell would on its own', () => {
+  // MEASURED, mongosh 2.13.0: with no option in the URI, a stalled connection
+  // failed with "Server selection timed out after 2000 ms" - mongosh does NOT
+  // use the Node driver's documented 30s default. A probe bound ABOVE that
+  // would slow the common case down in the name of speeding it up, which is
+  // the mistake this pin exists to catch.
+  assert.ok(PROBE_SELECTION_TIMEOUT_MS > 0 && PROBE_SELECTION_TIMEOUT_MS <= 2000,
+    'must not exceed mongosh 2.13.0 own 2000ms server-selection default');
+});
+
+test('the shipped URI_TEMPLATE itself carries no server-selection timeout', () => {
+  // The fix is scoped to the probe. Rewriting the shipped template would
+  // change replica-set timing, which this change must leave untouched.
+  assert.equal(URI_TEMPLATE.includes('serverSelectionTimeoutMS'), false);
+});

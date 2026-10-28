@@ -856,3 +856,298 @@ test('a shard collected successfully is not discarded when a later mongos call f
   assert.equal(b.coverage, 'none');
   assert.equal(b.error, 'router down');
 });
+
+// ---------------------------------------------------------------------------
+// FINDING 1 (final whole-branch review, CRITICAL): a multi-host indirect shard.
+//
+// mongos routes each namespace's aggregation independently, so any read
+// preference that can select more than one member per shard (secondaryPreferred,
+// nearest) makes a shard answer from several hosts in one run. collectFromMongos
+// used to model each shard as ONE node keyed by the first host it saw, while
+// marking EVERY host it saw a reachable member - so one member's evidence was
+// filed under another member's name, and a shard could claim coverage 'full'
+// (the only value that unlocks a drop) on a single member's evidence.
+//
+// Every fixture above uses one host per shard, which is why none of them saw it.
+
+const SPLIT_HOST_MONGOS = () => fakeMongos({
+  dbs: ['shop'],
+  colls: { shop: ['lookup', 'orders'] },
+  // shop.orders was answered by h1, shop.lookup by h2 - the same shard, two
+  // different members, exactly as secondaryPreferred routing produces.
+  collStats: {
+    'shop.orders': [{ shard: 'shardA', host: 'h1:27017',
+                      storageStats: { indexSizes: { _id_: 10, a_1: 20 } } }],
+    'shop.lookup': [{ shard: 'shardA', host: 'h2:27017',
+                      storageStats: { indexSizes: { _id_: 5, b_1: 7 } } }],
+  },
+  indexStats: {
+    'shop.orders': [
+      { shard: 'shardA', host: 'h1:27017', name: '_id_', key: { _id: 1 },
+        accesses: { ops: 4, since: OLD_SINCE } },
+      { shard: 'shardA', host: 'h1:27017', name: 'a_1', key: { a: 1 },
+        accesses: { ops: 0, since: OLD_SINCE } },
+    ],
+    'shop.lookup': [
+      { shard: 'shardA', host: 'h2:27017', name: '_id_', key: { _id: 1 },
+        accesses: { ops: 2, since: OLD_SINCE } },
+      { shard: 'shardA', host: 'h2:27017', name: 'b_1', key: { b: 1 },
+        accesses: { ops: 0, since: OLD_SINCE } },
+    ],
+  },
+});
+
+test('collectFromMongos gives each answering host of one shard its own node', () => {
+  const out = collectFromMongos(SPLIT_HOST_MONGOS(), MONGOS_CONFIG, ['shardA']);
+  assert.equal(out.nodeResults.length, 2, 'one node per (shard, host), not one per shard');
+
+  const h1 = out.nodeResults.find((r) => r.host === 'h1:27017');
+  const h2 = out.nodeResults.find((r) => r.host === 'h2:27017');
+  for (const n of [h1, h2]) assert.equal(n.shard, 'shardA');
+
+  // Each node carries ONLY the namespaces that host actually answered.
+  assert.deepEqual(h1.namespaces, ['shop.orders']);
+  assert.deepEqual(h2.namespaces, ['shop.lookup']);
+  assert.equal(h1.collections['shop.lookup'], undefined);
+  assert.equal(h2.collections['shop.orders'], undefined);
+
+  // ...and the evidence lands under the host that supplied it.
+  assert.equal(h1.collections['shop.orders'].usage._id_.ops, 4);
+  assert.equal(h1.collections['shop.orders'].storage.a_1.sizeBytes, 20);
+  assert.equal(h2.collections['shop.lookup'].usage._id_.ops, 2);
+  assert.equal(h2.collections['shop.lookup'].storage.b_1.sizeBytes, 7);
+
+  assert.deepEqual(out.observedByShard.shardA.attributedHosts.slice().sort(),
+    ['h1:27017', 'h2:27017']);
+  assert.equal(out.observedByShard.shardA.ambiguous, false);
+  assert.deepEqual(out.observedByShard.shardA.ambiguousHosts, []);
+});
+
+test('an indirect shard is not fully covered until every expected member supplied evidence', () => {
+  const out = collectSharded({
+    conn: SPLIT_HOST_MONGOS(), config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA',
+               hosts: ['h1:27017', 'h2:27017', 'h3:27017'], state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'secondaryPreferred', printFn() {},
+  });
+
+  const rec = out.shardRecords[0];
+  assert.equal(rec.mode, 'indirect');
+  assert.notEqual(rec.coverage, 'full');
+  assert.equal(rec.coverage, 'partial');
+  assert.deepEqual(rec.observedHosts.slice().sort(), ['h1:27017', 'h2:27017']);
+  assert.deepEqual(rec.expectedHosts, ['h1:27017', 'h2:27017', 'h3:27017']);
+
+  // Reachability now follows the evidence: a member is reachable when it has
+  // its own node, and only then.
+  const byHost = new Map(out.members.map((m) => [m.host, m]));
+  assert.equal(byHost.get('h1:27017').reachable, true);
+  assert.equal(byHost.get('h2:27017').reachable, true);
+  assert.equal(byHost.get('h3:27017').reachable, false);
+  assert.match(byHost.get('h3:27017').error, /readPreference secondaryPreferred/);
+});
+
+test('an indirect shard every expected member answered for is fully covered', () => {
+  // The positive control for the test above, and the capability
+  // RUNNING-ON-SHARDED-CLUSTERS.md section 2 promises: a single
+  // secondaryPreferred run genuinely widens coverage within one shard.
+  const out = collectSharded({
+    conn: SPLIT_HOST_MONGOS(), config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+               state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'secondaryPreferred', printFn() {},
+  });
+  assert.equal(out.shardRecords[0].coverage, 'full');
+  assert.deepEqual(out.shardRecords[0].observedHosts.slice().sort(),
+    ['h1:27017', 'h2:27017']);
+  for (const m of out.members) assert.equal(m.reachable, true);
+});
+
+test('a split-host indirect shard attributes each index to the member that reported it', () => {
+  const out = collectSharded({
+    conn: SPLIT_HOST_MONGOS(), config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+               state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'secondaryPreferred', printFn() {},
+  });
+  const payload = applyAnalysis(mergeNodes({
+    members: out.members, nodeResults: out.nodeResults, samples: [],
+    now: NOW, shards: out.shardRecords,
+  }), { DROP_MIN_COUNTER_DAYS: 14 }, []);
+
+  const a1 = payload.indexes.find((i) => i.ns === 'shop.orders' && i.name === 'a_1');
+  const b1 = payload.indexes.find((i) => i.ns === 'shop.lookup' && i.name === 'b_1');
+
+  // a_1 was reported by h1 only - so h1 carries its evidence, and h2 must not
+  // be recorded as present for it, nor blamed for its absence.
+  const a1h1 = a1.perNode.find((n) => n.host === 'h1:27017');
+  const a1h2 = a1.perNode.find((n) => n.host === 'h2:27017');
+  assert.equal(a1h1.present, true);
+  assert.equal(a1h1.sizeBytes, 20);
+  assert.equal(a1h2.present, false);
+  assert.equal(a1h2.observed, false, 'h2 was never asked about shop.orders');
+  assert.deepEqual(a1.definition.missingOn, [],
+    'a member that was never asked is not "missing the index"');
+  assert.equal(a1.definition.consistent, true);
+
+  // ...and symmetrically for the namespace h2 answered.
+  assert.equal(b1.perNode.find((n) => n.host === 'h2:27017').present, true);
+  assert.equal(b1.perNode.find((n) => n.host === 'h1:27017').present, false);
+
+  // THE SAFETY ASSERTION. Both counters are a year old and both indexes have
+  // zero operations, so only the coverage reasoning stands between this and a
+  // drop recommendation. Each index was seen by exactly one member of the
+  // shard, so neither may be called unused.
+  for (const idx of [a1, b1]) {
+    assert.notEqual(idx.verdict, 'drop');
+    assert.notEqual(idx.verdict, 'likely-drop');
+    assert.notEqual(idx.verdict, 'mismatched');
+    assert.equal(idx.verdict, 'inconclusive');
+    assert.equal(idx.flags.includes('unobserved-member'), true);
+  }
+});
+
+test('collectFromMongos refuses to credit one member when two answered for one namespace', () => {
+  // $collStats answered by h1, $indexStats by h2, for the SAME namespace.
+  // demuxShardStats blends them into one entry, which belongs to neither
+  // member alone - so the entry is kept (discarding it is the Task 12
+  // blank-report bug), attributed to one host for determinism, and the shard
+  // is flagged so it can never be called fully covered.
+  const conn = fakeMongos({
+    dbs: ['shop'], colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [{ shard: 'shardA', host: 'h1:27017',
+                                   storageStats: { indexSizes: { _id_: 10 } } }] },
+    indexStats: { 'shop.orders': [{ shard: 'shardA', host: 'h2:27017', name: '_id_',
+                                    key: { _id: 1 }, accesses: { ops: 1, since: SINCE } }] },
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  assert.equal(out.nodeResults.length, 1);
+  assert.equal(out.nodeResults[0].host, 'h1:27017');
+  assert.deepEqual(out.observedByShard.shardA.hosts, ['h1:27017', 'h2:27017']);
+  assert.deepEqual(out.observedByShard.shardA.attributedHosts, ['h1:27017']);
+  assert.deepEqual(out.observedByShard.shardA.ambiguousHosts, ['h2:27017']);
+  assert.equal(out.observedByShard.shardA.ambiguous, true);
+
+  const sharded = collectSharded({
+    conn, config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+               state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'nearest', printFn() {},
+  });
+  const rec = sharded.shardRecords[0];
+  assert.notEqual(rec.coverage, 'full');
+  assert.deepEqual(rec.observedHosts, ['h1:27017']);
+  assert.deepEqual(rec.ambiguousHosts, ['h2:27017']);
+  // The host whose evidence could not be credited to it is NOT a reachable
+  // member - that claim is exactly what finding 1 was about.
+  assert.equal(sharded.members.find((m) => m.host === 'h2:27017').reachable, false);
+});
+
+test('collectFromMongos keeps evidence that names no host at all, without inventing a member', () => {
+  const conn = fakeMongos({
+    dbs: ['shop'], colls: { shop: ['orders'] },
+    collStats: { 'shop.orders': [{ shard: 'shardA',
+                                   storageStats: { indexSizes: { _id_: 10 } } }] },
+    indexStats: {},
+  });
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  assert.equal(out.nodeResults.length, 1);
+  assert.equal(out.nodeResults[0].host, 'shardA/unattributed');
+  assert.deepEqual(out.nodeResults[0].namespaces, ['shop.orders']);
+  assert.deepEqual(out.observedByShard.shardA.attributedHosts, []);
+  assert.equal(out.observedByShard.shardA.ambiguous, true);
+
+  const sharded = collectSharded({
+    conn, config: MONGOS_CONFIG,
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017'],
+               state: 1, draining: false }],
+    MongoCtor: function () { throw new Error('no Mongo'); },
+    canOpenConnections: false, readPref: 'primary', printFn() {},
+  });
+  assert.equal(sharded.shardRecords[0].coverage, 'none');
+  assert.equal(sharded.members.find((m) => m.host === 'h1:27017').reachable, false);
+});
+
+test('a router-level skip is recorded against every answering member of the shard', () => {
+  // The database listing fails for the whole router, so no member of the
+  // shard has evidence for it - including the hosts discovered later, which
+  // is why the skips are attached once the sweep is done.
+  let calls = 0;
+  const conn = {
+    getDB(name) {
+      return {
+        adminCommand() { return { databases: [{ name: 'broken' }, { name: 'shop' }] }; },
+        getCollectionInfos() {
+          calls += 1;
+          if (name === 'broken') {
+            throw Object.assign(new Error('nope'), { codeName: 'Unauthorized' });
+          }
+          return [{ name: 'lookup' }, { name: 'orders' }];
+        },
+        getCollection(collName) {
+          const host = collName === 'orders' ? 'h1:27017' : 'h2:27017';
+          return {
+            aggregate(pipeline) {
+              const stage = Object.keys(pipeline[0])[0];
+              return { toArray() {
+                return stage === '$collStats'
+                  ? [{ shard: 'shardA', host, storageStats: { indexSizes: { _id_: 1 } } }]
+                  : [{ shard: 'shardA', host, name: '_id_', key: { _id: 1 },
+                       accesses: { ops: 0, since: SINCE } }];
+              } };
+            },
+          };
+        },
+      };
+    },
+  };
+  const out = collectFromMongos(conn, MONGOS_CONFIG, ['shardA']);
+  assert.ok(calls > 0);
+  assert.equal(out.nodeResults.length, 2);
+  for (const n of out.nodeResults) {
+    assert.deepEqual(n.skipped, [{ ns: 'broken', reason: 'Unauthorized' }],
+      `${n.host} must record the database it could not be asked about`);
+  }
+});
+
+test('the per-shard direct probe carries a bounded server-selection timeout', () => {
+  // FINDING 4: MAX_TIME_MS cannot bound `new Mongo(uri)`. Without this, every
+  // shard of a firewalled or Atlas cluster - where the probe MUST fail for the
+  // indirect design to engage - burned the driver default in turn.
+  const seen = [];
+  collectSharded({
+    conn: fakeMongos({ dbs: [], colls: {}, collStats: {}, indexStats: {} }),
+    config: { ...MONGOS_CONFIG, URI_TEMPLATE: 'mongodb://{host}/?directConnection=true' },
+    shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017'],
+               state: 1, draining: false }],
+    MongoCtor: function (uri) { seen.push(uri); throw new Error('refused'); },
+    canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+  assert.equal(seen.length, 1, 'exactly one probe connection per shard');
+  assert.equal(seen[0],
+    'mongodb://h1:27017/?directConnection=true&serverSelectionTimeoutMS=2000');
+});
+
+test('the real per-member collection connections use the template verbatim', () => {
+  // The timeout is scoped to the probe. A shard that answers must be collected
+  // with exactly the connection string the user configured.
+  const seen = [];
+  collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [SHARD_A],
+    MongoCtor: function (host) {
+      seen.push(host);
+      return fakeShardMemberConn(host.split('/?')[0], SHARD_A_RSCONFIG);
+    },
+    canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+  // First call is the probe; every later one is a real collection connection.
+  assert.match(seen[0], /serverSelectionTimeoutMS=2000$/);
+  for (const uri of seen.slice(1)) {
+    assert.equal(uri.includes('serverSelectionTimeoutMS'), false, uri);
+  }
+  assert.deepEqual(seen.slice(1), ['h1:27017', 'h1:27017', 'h2:27017']);
+});

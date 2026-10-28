@@ -393,3 +393,110 @@ test('merged non-sharded payload has unchanged aggregates and no sizeEstimated f
   assert.equal(p.indexes[0].perMemberSizeBytes, 500);
   assert.equal(p.indexes[0].sizeEstimated, false);
 });
+
+// ---------------------------------------------------------------------------
+// FINDING 2 (final whole-branch review, important): mergePeerPayloads
+// recomputed definition.missingOn without excluding definition.notHosting,
+// which mergeNodes is careful to keep separate. Every member of a shard that
+// never held the namespace was therefore recomputed INTO missingOn on merge,
+// flipping definition.consistent to false and the verdict from likely-drop to
+// mismatched - a member blamed for lacking an index it was never supposed to
+// have. Invisible until now because every fixture in this file used
+// `notHosting: []`.
+
+function notHostingLocalPayload() {
+  return {
+    meta: { mode: 'single-node' },
+    members: [
+      { id: 0, host: 'h1:27017', role: 'primary', hidden: false, delaySecs: 0, votes: 1,
+        reachable: true, error: null, shard: 'shardA' },
+      // Reachable, fully observed - and on a shard that simply does not hold
+      // shop.lookup.
+      { id: 0, host: 'h3:27017', role: 'primary', hidden: false, delaySecs: 0, votes: 1,
+        reachable: true, error: null, shard: 'shardB' },
+    ],
+    shards: [
+      { name: 'shardA', setName: 'shardA', hosts: ['h1:27017'], state: 1, draining: false,
+        mode: 'direct', coverage: 'full', expectedHosts: ['h1:27017'],
+        observedHosts: ['h1:27017'], ambiguousHosts: [], readPref: 'primary', error: null },
+      { name: 'shardB', setName: 'shardB', hosts: ['h3:27017'], state: 1, draining: false,
+        mode: 'direct', coverage: 'full', expectedHosts: ['h3:27017'],
+        observedHosts: ['h3:27017'], ambiguousHosts: [], readPref: 'primary', error: null },
+    ],
+    gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [{ ns: 'shop.lookup', db: 'shop', coll: 'lookup', presentOn: ['h1:27017'],
+      shards: ['shardA'], hasValidator: false, sample: null }],
+    indexes: [{
+      ns: 'shop.lookup', name: 'code_1', key: { code: 1 }, options: {}, hidden: false,
+      perNode: [{ host: 'h1:27017', shard: 'shardA', present: true, ops: 0, since: null,
+                  counterAgeDays: 40, sizeBytes: 1000, reusableBytes: 0, cacheBytes: 0,
+                  error: null }],
+      maxOps: 0, minCounterAgeDays: 40, clusterSizeBytes: 1000, perMemberSizeBytes: 1000,
+      perShard: [{ shard: 'shardA', ops: 0, observedSizeBytes: 1000, observedNodes: 1,
+                   present: true, sizeBytes: 1000 }],
+      sizeEstimated: false,
+      redundancy: { class: null, coveredBy: null },
+      definition: { consistent: true, missingOn: [], notHosting: ['h3:27017'],
+                    variants: [{ key: { code: 1 }, hosts: ['h1:27017'] }] },
+      schema: { checks: [] },
+    }],
+  };
+}
+
+// A peer that contributes no member evidence at all, so the ONLY thing under
+// test is the post-merge recomputation.
+function emptyPeer() {
+  return {
+    meta: { mode: 'single-node' },
+    members: [],
+    shards: [],
+    gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [],
+    indexes: [],
+  };
+}
+
+test('control: before merging, a not-hosting member is not a missing definition', () => {
+  const p = applyAnalysis(notHostingLocalPayload(), CONFIG, []);
+  assert.equal(p.indexes[0].definition.consistent, true);
+  assert.equal(p.indexes[0].verdict, 'likely-drop');
+});
+
+test('merging keeps a not-hosting member out of the recomputed missingOn', () => {
+  const merged = mergePeerPayloads(notHostingLocalPayload(), [emptyPeer()]);
+  const idx = merged.indexes[0];
+  assert.deepEqual(idx.definition.missingOn, [],
+    'a shard that does not hold the collection is not missing the index');
+  assert.equal(idx.definition.consistent, true);
+  assert.deepEqual(idx.definition.notHosting, ['h3:27017'], 'notHosting survives the merge');
+
+  const p = applyAnalysis(merged, CONFIG, []);
+  assert.equal(p.indexes[0].verdict, 'likely-drop',
+    'the merge must not turn a clean verdict into mismatched');
+});
+
+test('merging still records a genuinely missing definition on a hosting member', () => {
+  // The positive control: the exclusion must be exactly notHosting, not a
+  // blanket disabling of the recomputation. h2 is on the shard that DOES hold
+  // the namespace and never reported the index, so it is genuinely missing it.
+  const local = notHostingLocalPayload();
+  local.members.push({ id: 1, host: 'h2:27017', role: 'secondary', hidden: false,
+    delaySecs: 0, votes: 1, reachable: true, error: null, shard: 'shardA' });
+  local.shards[0].hosts.push('h2:27017');
+  local.shards[0].expectedHosts.push('h2:27017');
+  local.shards[0].observedHosts.push('h2:27017');
+
+  const merged = mergePeerPayloads(local, [emptyPeer()]);
+  assert.deepEqual(merged.indexes[0].definition.missingOn, ['h2:27017']);
+  assert.equal(merged.indexes[0].definition.consistent, false);
+  assert.equal(applyAnalysis(merged, CONFIG, []).indexes[0].verdict, 'mismatched');
+});
+
+test('merging tolerates an index record with no notHosting field at all', () => {
+  // A payload pasted from an older build of the script.
+  const local = notHostingLocalPayload();
+  delete local.indexes[0].definition.notHosting;
+  const merged = mergePeerPayloads(local, [emptyPeer()]);
+  assert.deepEqual(merged.indexes[0].definition.missingOn, ['h3:27017'],
+    'with nothing recorded as not-hosting, the old reading is all there is');
+});

@@ -44,9 +44,12 @@ mongosh "mongodb+srv://<user>@<cluster>.mongodb.net/?readPreference=secondaryPre
 
 This is still routed through `mongos`, but now a secondary answers instead of the primary when one
 is available. Each namespace's `$collStats`/`$indexStats` call is routed independently, so a single
-run can genuinely observe more than one distinct secondary per shard — the script accumulates every
-host it sees. The script never overrides the read preference your connection string sets —
-whatever you pass is what gets recorded in the report and used to pick which member answers.
+run can genuinely observe more than one distinct secondary per shard. Each observed member is
+recorded as a member in its own right, carrying only the namespaces it actually answered for — so
+the evidence is attributed to the member that supplied it, and the shard's coverage counts the
+members that genuinely reported something. The script never overrides the read preference your
+connection string sets — whatever you pass is what gets recorded in the report and used to pick
+which member answers.
 
 It still does not reach **every** member of every shard, in general. `secondaryPreferred` just
 means the primary is never selected while a secondary is available — it is not a guarantee that
@@ -95,6 +98,12 @@ member list. Three coverage values:
 | `full` | Every data-bearing member of this shard answered. Zero-op indexes on this shard can be judged unused. |
 | `partial` | At least one data-bearing member was never consulted — typically the normal `mongos`-routed case, where only the read-preference-selected member answered, or one direct member genuinely failed. |
 | `none` | Nothing answered for this shard at all — the whole shard is a blind spot. |
+
+`full` means every data-bearing member of the shard supplied evidence of its own. Coverage is a
+statement about members, not about any one index: a *second*, per-index gate still applies, so an
+index no member of a shard reported on is `inconclusive` even where the shard as a whole is
+`full`. That is the usual outcome of a `secondaryPreferred` run, where each namespace is answered
+by one member and its siblings were never asked about that particular namespace.
 
 **Any shard short of `full` downgrades zero-usage verdicts to `inconclusive` for every namespace it
 hosts**, the same way an unreachable replica-set member does on a plain replica set. This is a
