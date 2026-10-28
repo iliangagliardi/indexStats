@@ -510,6 +510,31 @@
       } catch (e) {
         shardError = e.codeName ?? e.message;
         printFn(`shard ${shard.name}: direct collection failed (${shardError})`);
+        // CRITICAL: a wholly-failed direct shard - the seed connection refused,
+        // or discoverMembers re-throwing a non-NoReplicationEnabled error such
+        // as Unauthorized, which is realistic whenever the shard credentials in
+        // URI_TEMPLATE differ from the mongos session - would otherwise
+        // contribute NO member entries at all. Nothing then reaches
+        // gaps.unreachableMembers, so ctx.unreachableHosts stays empty and that
+        // gate is silent; and the shard's coverage:'none' record gates nothing
+        // either, because nsShards is built only from shards that actually
+        // reported a namespace, so a shard that reported nothing appears in no
+        // namespace's list. A zero-operation index could then still be
+        // recommended for drop while the member that might be using it was
+        // never consulted - the unreachable-member downgrade this project
+        // treats as load-bearing, silently skipped. Synthesise the same shape
+        // the indirect branch below already builds, so the gates can see the
+        // hole. (Deliberately NOT a fallback to the mongos: a directly-reached
+        // shard that fails is reported as a gap, not re-collected through the
+        // router, so the report keeps one evidence model.)
+        if (!shardMembers.length) {
+          for (const host of shard.hosts) {
+            shardMembers.push({
+              id: null, host, shard: shard.name, role: 'unknown', hidden: false,
+              delaySecs: 0, votes: 1, reachable: false, error: shardError,
+            });
+          }
+        }
       }
 
       members.push(...shardMembers);
@@ -529,16 +554,32 @@
 
     if (indirect.length) {
       const names = indirect.map((s) => s.name);
-      const viaMongos = collectFromMongos(conn, config, names);
-      nodeResults.push(...viaMongos.nodeResults);
+      // Guarded: collectFromMongos' first statement is a listDatabases through
+      // the router with no try of its own, so an unguarded throw here would
+      // propagate out of collectSharded, out of main(), and hit the bottom
+      // gate - printing FATAL and emitting NO report at all, discarding every
+      // shard already collected successfully. The non-sharded path has always
+      // caught member-level failures and carried on; so must this one. A failed
+      // router call becomes an honest gap, not a lost run.
+      let viaMongos = null;
+      let mongosError = null;
+      try {
+        viaMongos = collectFromMongos(conn, config, names);
+      } catch (e) {
+        mongosError = e.codeName ?? e.message;
+        printFn(`collection through mongos failed (${mongosError}) - `
+          + `${names.length} shard(s) reported as unobserved`);
+      }
+      const observedByShard = viaMongos ? viaMongos.observedByShard : {};
+      if (viaMongos) nodeResults.push(...viaMongos.nodeResults);
       for (const shard of indirect) {
-        const seen = viaMongos.observedByShard[shard.name] ?? { hosts: [], unattributed: false };
+        const seen = observedByShard[shard.name] ?? { hosts: [], unattributed: false };
         shardRecords.push(buildShardRecord(shard, {
           mode: 'indirect',
           expectedHosts: shard.hosts,
           observedHosts: seen.hosts,
           readPref,
-          error: null,
+          error: mongosError,
           unattributed: seen.unattributed,
         }));
         // Every configured member of an indirect shard becomes a member entry:
@@ -551,7 +592,9 @@
             delaySecs: 0, votes: 1,
             reachable: seen.hosts.includes(host),
             error: seen.hosts.includes(host) ? null
-              : `not observed - routed through mongos with readPreference ${readPref}`,
+              : (mongosError
+                ? `not observed - collection through mongos failed (${mongosError})`
+                : `not observed - routed through mongos with readPreference ${readPref}`),
           });
         }
       }
@@ -1399,24 +1442,33 @@
     };
     const seed = deriveSeedHost(db.getSiblingDB('admin'), db, config);
     config.SEED_HOST = seed.host;
-    const helloDoc = (function () {
-      try {
-        return db.getSiblingDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
-      } catch (e) {
-        return null;
-      }
-    })();
-    const topology = detectTopology(helloDoc);
+    // Plain statement form, deliberately - NOT an IIFE. mongosh's async-rewriter
+    // silently miscompiles constructs it cannot classify (three of this
+    // project's five known live bugs were exactly that), and a shell API call
+    // inside a non-async function expression is precisely such a construct. If
+    // it returned a Promise here, detectTopology would see an object with no
+    // msg/setName, answer 'standalone', and the whole sharded path would be
+    // silently dead on a real mongos - with no unit test able to see it.
+    let helloDoc = null;
+    try {
+      helloDoc = db.getSiblingDB('admin').runCommand({ hello: 1, maxTimeMS: config.MAX_TIME_MS });
+    } catch (e) {
+      helloDoc = null;
+    }
+    // detectTopology defaults a missing document to 'standalone', which ROUTES
+    // correctly (anything not 'sharded' takes the replica-set path), but
+    // recording it as fact would have meta.topology say 'standalone' while
+    // meta.replicaSetName in the same object names a replica set. Report what
+    // was actually established.
+    const topology = helloDoc === null ? 'unknown' : detectTopology(helloDoc);
     // Whatever read preference the user's own connection carries is what the
     // indirect path actually observes. Report it; never override it.
-    const readPref = (function () {
-      try {
-        const rp = db.getMongo().getReadPrefMode();
-        return rp || 'primary';
-      } catch (e) {
-        return 'primary';
-      }
-    })();
+    let readPref = 'primary';
+    try {
+      readPref = db.getMongo().getReadPrefMode() || 'primary';
+    } catch (e) {
+      readPref = 'primary';
+    }
     const caps = probeCapabilities({
       requireFn: typeof require === 'function' ? require
         : () => { throw new Error('no require'); },

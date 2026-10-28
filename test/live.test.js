@@ -522,7 +522,14 @@ const DIRECT_CONFIG = {
 // A null rsConfig stands in for a bare standalone shard, where
 // replSetGetConfig reports NoReplicationEnabled and discoverMembers takes its
 // single-node fallback.
-function fakeShardMemberConn(host, rsConfig) {
+// `stats` overrides what shop.orders reports, for the end-to-end verdict test
+// below; it defaults to a single, used _id_ index.
+function fakeShardMemberConn(host, rsConfig, stats) {
+  const s = stats ?? {
+    indexSizes: { _id_: 10 },
+    indexStats: [{ name: '_id_', accesses: { ops: 3, since: SINCE } }],
+    indexes: [{ name: '_id_', key: { _id: 1 } }],
+  };
   return {
     setReadPref() {},
     getDB(name) {
@@ -556,13 +563,11 @@ function fakeShardMemberConn(host, rsConfig) {
                 'aggregations must carry maxTimeMS');
               const stage = Object.keys(pipeline[0])[0];
               if (stage === '$collStats') {
-                return { toArray() { return [{ storageStats: { indexSizes: { _id_: 10 } } }]; } };
+                return { toArray() { return [{ storageStats: { indexSizes: s.indexSizes } }]; } };
               }
-              return { toArray() {
-                return [{ name: '_id_', accesses: { ops: 3, since: SINCE } }];
-              } };
+              return { toArray() { return s.indexStats; } };
             },
-            getIndexes() { return [{ name: '_id_', key: { _id: 1 } }]; },
+            getIndexes() { return s.indexes; },
           };
         },
       };
@@ -674,4 +679,180 @@ test('a standalone shard is identified by its own host, never by the mongos SEED
   assert.deepEqual(out.shardRecords[0].expectedHosts, ['s1:27017']);
   assert.deepEqual(out.shardRecords[0].observedHosts, ['s1:27017']);
   assert.deepEqual(out.nodeResults.map((r) => r.host), ['s1:27017']);
+});
+
+// FINDING 1 (review, critical): a direct shard that fails WHOLESALE - seed
+// connection refused, or discoverMembers re-throwing Unauthorized because the
+// shard credentials in URI_TEMPLATE differ from the mongos session - used to
+// contribute no member entries at all, so it reached none of the safety gates.
+const SHARD_B = { name: 'shardB', setName: 'shardB', hosts: ['b1:27017', 'b2:27017'],
+                  state: 1, draining: false };
+
+// The realistic wholesale failure: the connection OPENS - so the probe succeeds
+// and the shard is legitimately chosen for DIRECT collection - but
+// discoverMembers' replSetGetConfig is refused, because the credentials in
+// URI_TEMPLATE do not carry the shard privileges the mongos session had.
+// discoverMembers deliberately re-throws anything that is not
+// NoReplicationEnabled/NotYetInitialized rather than silently degrading, so the
+// whole shard fails after the mode decision was already made.
+//
+// (A shard whose probe itself fails is a different case entirely: it is routed
+// to the mongos by design, and is covered by the indirect tests above.)
+function unauthorizedShardConn() {
+  return {
+    setReadPref() {},
+    getDB() {
+      return {
+        runCommand() {
+          const e = new Error('command replSetGetConfig requires authentication');
+          e.codeName = 'Unauthorized';
+          throw e;
+        },
+      };
+    },
+  };
+}
+
+test('a direct shard that fails wholesale still reports its hosts as unreachable members', () => {
+  const printed = [];
+  const out = collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [SHARD_B],
+    MongoCtor: function () { return unauthorizedShardConn(); },
+    canOpenConnections: true, readPref: 'primary', printFn(m) { printed.push(m); },
+  });
+
+  // The shard must not vanish: every configured host is accounted for.
+  assert.deepEqual(out.members.map((m) => m.host), ['b1:27017', 'b2:27017']);
+  for (const m of out.members) {
+    assert.equal(m.reachable, false);
+    assert.equal(m.shard, 'shardB');
+    assert.equal(m.error, 'Unauthorized');
+  }
+  assert.equal(out.shardRecords.length, 1);
+  assert.equal(out.shardRecords[0].mode, 'direct');
+  assert.notEqual(out.shardRecords[0].coverage, 'full');
+  assert.equal(out.shardRecords[0].coverage, 'none');
+  assert.deepEqual(out.shardRecords[0].expectedHosts, ['b1:27017', 'b2:27017']);
+  assert.deepEqual(out.shardRecords[0].observedHosts, []);
+  assert.equal(out.shardRecords[0].error, 'Unauthorized');
+  assert.deepEqual(out.nodeResults, []);
+  assert.ok(printed.some((m) => /shardB: direct collection failed/.test(m)));
+});
+
+// The assertion that actually matters: the end-to-end consequence. A wholly
+// failed shard must hold back a verdict that would otherwise be droppable.
+const { mergeNodes, applyAnalysis } = require('../indexStats.js');
+
+const NOW = new Date('2026-01-01T00:00:00Z');
+const OLD_SINCE = new Date('2025-01-01T00:00:00Z'); // 365 days - well past the 14-day threshold
+const DROPPABLE_STATS = {
+  indexSizes: { _id_: 10, status_1: 5000 },
+  indexStats: [
+    { name: '_id_', accesses: { ops: 5, since: OLD_SINCE } },
+    { name: 'status_1', accesses: { ops: 0, since: OLD_SINCE } },
+  ],
+  indexes: [{ name: '_id_', key: { _id: 1 } }, { name: 'status_1', key: { status: 1 } }],
+};
+
+function analyse(shards, MongoCtor) {
+  const out = collectSharded({
+    conn: POISON_MONGOS, config: DIRECT_CONFIG, shards,
+    MongoCtor, canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+  const payload = mergeNodes({
+    members: out.members, nodeResults: out.nodeResults, samples: [],
+    now: NOW, shards: out.shardRecords,
+  });
+  return applyAnalysis(payload, { DROP_MIN_COUNTER_DAYS: 14 }, []);
+}
+
+// Control: with only the healthy shard, this index really is droppable. Without
+// this, the guarded case below could pass for an unrelated reason.
+test('control: a zero-ops index on a fully observed shard is droppable', () => {
+  const payload = analyse([SHARD_A], function (host) {
+    return fakeShardMemberConn(host, SHARD_A_RSCONFIG, DROPPABLE_STATS);
+  });
+  const idx = payload.indexes.find((i) => i.name === 'status_1');
+  assert.equal(idx.verdict, 'likely-drop');
+});
+
+test('a wholly-failed direct shard holds back an otherwise-droppable index', () => {
+  const payload = analyse([SHARD_A, SHARD_B], function (host) {
+    if (host.startsWith('b')) return unauthorizedShardConn();
+    return fakeShardMemberConn(host, SHARD_A_RSCONFIG, DROPPABLE_STATS);
+  });
+
+  // The failed shard's members reached the gap accounting at all - this is the
+  // mechanism the verdict below depends on.
+  assert.deepEqual(payload.gaps.unreachableMembers.map((m) => m.host),
+    ['b1:27017', 'b2:27017']);
+
+  const idx = payload.indexes.find((i) => i.name === 'status_1');
+  assert.notEqual(idx.verdict, 'drop');
+  assert.notEqual(idx.verdict, 'likely-drop');
+  assert.equal(idx.verdict, 'inconclusive');
+  assert.match(idx.reasons.join(' '), /b1:27017, b2:27017 could not be reached/);
+});
+
+// FINDING 2 (review, important): collectFromMongos' first statement is an
+// unguarded listDatabases through the router. A throw used to propagate out of
+// main() to the bottom gate, printing FATAL and emitting no report at all -
+// discarding every shard already collected successfully.
+test('a failing mongos call degrades to a gap instead of aborting the whole run', () => {
+  const brokenMongos = {
+    getDB() {
+      const e = new Error('not authorized on admin to execute listDatabases');
+      e.codeName = 'Unauthorized';
+      throw e;
+    },
+  };
+  const printed = [];
+  let out;
+  assert.doesNotThrow(() => {
+    out = collectSharded({
+      conn: brokenMongos, config: MONGOS_CONFIG,
+      shards: [{ name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2:27017'],
+                 state: 1, draining: false }],
+      MongoCtor: function () { throw new Error('no Mongo'); },
+      canOpenConnections: false, readPref: 'primary', printFn(m) { printed.push(m); },
+    });
+  });
+
+  assert.equal(out.shardRecords.length, 1);
+  assert.equal(out.shardRecords[0].mode, 'indirect');
+  assert.equal(out.shardRecords[0].coverage, 'none');
+  assert.equal(out.shardRecords[0].error, 'Unauthorized');
+  assert.deepEqual(out.shardRecords[0].observedHosts, []);
+  assert.deepEqual(out.nodeResults, []);
+  // Both configured hosts are still accounted for, so the gates can see them.
+  assert.deepEqual(out.members.map((m) => m.host), ['h1:27017', 'h2:27017']);
+  for (const m of out.members) {
+    assert.equal(m.reachable, false);
+    assert.match(m.error, /collection through mongos failed \(Unauthorized\)/);
+  }
+  assert.ok(printed.some((m) => /collection through mongos failed/.test(m)));
+});
+
+test('a shard collected successfully is not discarded when a later mongos call fails', () => {
+  // shardA is reachable directly; shardB can only go through the router, which
+  // fails. The direct shard's evidence must survive.
+  const brokenMongos = { getDB() { throw new Error('router down'); } };
+  const out = collectSharded({
+    conn: brokenMongos, config: DIRECT_CONFIG, shards: [SHARD_A, SHARD_B],
+    MongoCtor: function (host) {
+      if (host.startsWith('b')) throw new Error('refused'); // forces shardB indirect
+      return fakeShardMemberConn(host, SHARD_A_RSCONFIG);
+    },
+    canOpenConnections: true, readPref: 'primary', printFn() {},
+  });
+
+  const a = out.shardRecords.find((s) => s.name === 'shardA');
+  assert.equal(a.mode, 'direct');
+  assert.equal(a.coverage, 'full');
+  assert.deepEqual(out.nodeResults.map((r) => r.host), ['h1:27017', 'h2:27017']);
+
+  const b = out.shardRecords.find((s) => s.name === 'shardB');
+  assert.equal(b.mode, 'indirect');
+  assert.equal(b.coverage, 'none');
+  assert.equal(b.error, 'router down');
 });
