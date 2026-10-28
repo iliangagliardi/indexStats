@@ -608,17 +608,28 @@
     return { byShard, unattributed };
   }
 
-  function mergeNodes({ members, nodeResults, samples, now }) {
+  function mergeNodes({ members, nodeResults, samples, now, shards }) {
     const at = now instanceof Date ? now : new Date();
     const byHost = new Map(nodeResults.map((r) => [r.host, r]));
     const reachable = members.filter((m) => m.reachable);
+    const shardList = shards ?? [];
     const skipped = [];
     const nsPresence = new Map();
+    // Which shard does each member belong to? `null` is the implicit single
+    // shard every non-sharded deployment uses, which keeps one code path for
+    // replica sets, standalones and sharded clusters alike.
+    const shardOfHost = new Map(members.map((m) => [m.host, m.shard ?? null]));
+    // Which shards actually reported each namespace? This is the single source
+    // of truth for placement: it needs no extra privilege, it is identical in
+    // direct and indirect mode, and it cannot disagree with the data collected.
+    const shardsOfNs = new Map();
 
     for (const r of nodeResults) {
       for (const ns of r.namespaces) {
         if (!nsPresence.has(ns)) nsPresence.set(ns, []);
         nsPresence.get(ns).push(r.host);
+        if (!shardsOfNs.has(ns)) shardsOfNs.set(ns, new Set());
+        shardsOfNs.get(ns).add(r.shard ?? null);
       }
       for (const s of r.skipped) skipped.push({ member: r.host, ns: s.ns, reason: s.reason });
       for (const [ns, coll] of Object.entries(r.collections)) {
@@ -636,17 +647,29 @@
       const specsForRedundancy = [];
       const opsByName = {};
       const built = [];
+      const hostingShards = shardsOfNs.get(ns) ?? new Set([null]);
 
       for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
         const perNode = [];
         const variants = new Map();
         const missingOn = [];
+        const notHosting = [];
         let maxOps = 0;
         let minAge = Infinity;
         let clusterSize = 0;
         let firstSpec = null;
 
         for (const m of reachable) {
+          // A shard that does not hold this collection is not "missing the
+          // index" - it was never supposed to have it. Recording it in
+          // missingOn would mark almost every index on an unsharded collection
+          // mismatched; recording it nowhere would let the unobserved-member
+          // gate in deriveVerdict treat it as a coverage hole. It gets its own
+          // list, which is neither.
+          if (!hostingShards.has(shardOfHost.get(m.host) ?? null)) {
+            notHosting.push(m.host);
+            continue;
+          }
           const coll = byHost.get(m.host)?.collections[ns];
           // Verified bug (Task 11, real mongosh 2.9.2 --file execution, not the unit
           // tests which use plain `require` and never see it): mongosh's async-rewriter
@@ -672,7 +695,8 @@
               const skip = byHost.get(m.host)?.skipped.find((s) => s.ns === dbName);
               if (skip) observationError = skip.reason;
             }
-            perNode.push({ host: m.host, present: false, ops: null, since: null,
+            perNode.push({ host: m.host, shard: shardOfHost.get(m.host) ?? null,
+                           present: false, ops: null, since: null,
                            counterAgeDays: null, sizeBytes: 0, reusableBytes: 0,
                            cacheBytes: 0, error: observationError });
             continue;
@@ -691,7 +715,8 @@
           maxOps = Math.max(maxOps, ops);
           minAge = Math.min(minAge, ageDays);
           clusterSize += store.sizeBytes;
-          perNode.push({ host: m.host, present: true, ops, since,
+          perNode.push({ host: m.host, shard: shardOfHost.get(m.host) ?? null,
+                         present: true, ops, since,
                          counterAgeDays: ageDays, sizeBytes: store.sizeBytes,
                          reusableBytes: store.reusableBytes,
                          cacheBytes: store.cacheBytes, error: null });
@@ -699,12 +724,24 @@
 
         const presentNodes = perNode.filter((n) => n.present);
         const { name: _n, key: _k, v: _v, ns: _ns, ...options } = firstSpec ?? { key: {} };
+        const perShardMap = new Map();
+        for (const node of perNode) {
+          if (!node.present) continue;
+          const key = node.shard ?? null;
+          const agg = perShardMap.get(key)
+            ?? { shard: key, ops: 0, observedSizeBytes: 0, observedNodes: 0, present: true };
+          agg.ops = Math.max(agg.ops, node.ops);
+          agg.observedSizeBytes += node.sizeBytes;
+          agg.observedNodes += 1;
+          perShardMap.set(key, agg);
+        }
         built.push({
           ns, name,
           key: firstSpec?.key ?? {},
           options,
           hidden: Boolean(firstSpec?.hidden),
           perNode, maxOps,
+          perShard: [...perShardMap.values()],
           minCounterAgeDays: minAge === Infinity ? null : minAge,
           clusterSizeBytes: clusterSize,
           perMemberSizeBytes: presentNodes.length
@@ -713,6 +750,7 @@
           definition: {
             consistent: missingOn.length === 0 && variants.size <= 1,
             missingOn,
+            notHosting,
             variants: [...variants.values()],
           },
         });
@@ -729,6 +767,7 @@
 
     return {
       members,
+      shards: shardList,
       gaps: {
         unreachableMembers: members.filter((m) => !m.reachable)
           .map((m) => ({ host: m.host, error: m.error })),
@@ -739,6 +778,7 @@
         return {
           ns, db: ns.split('.')[0], coll: ns.split('.').slice(1).join('.'),
           presentOn,
+          shards: [...(shardsOfNs.get(ns) ?? new Set([null]))],
           hasValidator: Boolean(sample?.validator),
           sample: sample ? { size: sample.size, member: sample.member } : null,
         };

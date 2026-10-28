@@ -156,3 +156,142 @@ test('a per-database skip (Unauthorized) also carries its reason onto perNode an
   assert.equal(h1Node.present, false);
   assert.equal(h1Node.error, 'Unauthorized');
 });
+
+test('mergeNodes records which shard each member belongs to, on members and on perNode', () => {
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'] },
+      { name: 'shardB', coverage: 'full', expectedHosts: ['h3:27017'], observedHosts: ['h3:27017'] },
+    ],
+    nodeResults: [
+      { host: 'h1:27017', shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: {}, storage: {}, error: null } } },
+      { host: 'h3:27017', shard: 'shardB', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: {}, storage: {}, error: null } } },
+    ],
+    samples: [], now: new Date(),
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.deepEqual(idx.perNode.map((n) => n.shard).sort(), ['shardA', 'shardB']);
+  assert.equal(merged.shards.length, 2);
+});
+
+test('an unsharded collection is not reported missing on the shards that do not hold it', () => {
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'] },
+      { name: 'shardB', coverage: 'full', expectedHosts: ['h3:27017'], observedHosts: ['h3:27017'] },
+    ],
+    nodeResults: [
+      // shop.lookup is unsharded: only shardA, the primary shard, reports it.
+      { host: 'h1:27017', shard: 'shardA', namespaces: ['shop.lookup'], skipped: [],
+        collections: { 'shop.lookup': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: {}, storage: {}, error: null } } },
+      { host: 'h3:27017', shard: 'shardB', namespaces: [], skipped: [], collections: {} },
+    ],
+    samples: [], now: new Date(),
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.deepEqual(idx.definition.missingOn, []);
+  assert.deepEqual(idx.definition.notHosting, ['h3:27017']);
+  assert.equal(idx.definition.consistent, true);
+});
+
+test('an index genuinely absent on a shard that DOES host the collection is still a mismatch', () => {
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'] },
+      { name: 'shardB', coverage: 'full', expectedHosts: ['h3:27017'], observedHosts: ['h3:27017'] },
+    ],
+    nodeResults: [
+      { host: 'h1:27017', shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: '_id_', key: { _id: 1 } }, { name: 'a_1', key: { a: 1 } }], usage: {}, storage: {}, error: null } } },
+      // shardB hosts the collection but is missing a_1 - a stalled rolling build.
+      { host: 'h3:27017', shard: 'shardB', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: '_id_', key: { _id: 1 } }], usage: {}, storage: {}, error: null } } },
+    ],
+    samples: [], now: new Date(),
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.deepEqual(idx.definition.missingOn, ['h3:27017']);
+  assert.equal(idx.definition.consistent, false);
+});
+
+test('namespaces record which shards host them', () => {
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'] },
+      { name: 'shardB', coverage: 'full', expectedHosts: ['h3:27017'], observedHosts: ['h3:27017'] },
+    ],
+    nodeResults: [
+      { host: 'h1:27017', shard: 'shardA', namespaces: ['shop.lookup'], skipped: [],
+        collections: { 'shop.lookup': { indexes: [{ name: '_id_', key: { _id: 1 } }], usage: {}, storage: {}, error: null } } },
+      { host: 'h3:27017', shard: 'shardB', namespaces: [], skipped: [], collections: {} },
+    ],
+    samples: [], now: new Date(),
+  });
+  assert.deepEqual(merged.namespaces.find((n) => n.ns === 'shop.lookup').shards, ['shardA']);
+});
+
+test('mergeNodes builds a per-shard breakdown with the highest ops seen on each shard', () => {
+  const since = new Date('2026-01-01T00:00:00Z');
+  const merged = mergeNodes({
+    members: [
+      { host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h2:27017', shard: 'shardA', reachable: true, hidden: false },
+      { host: 'h3:27017', shard: 'shardB', reachable: true, hidden: false },
+    ],
+    shards: [
+      { name: 'shardA', coverage: 'full', expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017', 'h2:27017'] },
+      { name: 'shardB', coverage: 'full', expectedHosts: ['h3:27017'], observedHosts: ['h3:27017'] },
+    ],
+    nodeResults: [
+      { host: 'h1:27017', shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: { a_1: { ops: 4, since } }, storage: { a_1: { sizeBytes: 100, reusableBytes: 0, cacheBytes: 0 } }, error: null } } },
+      { host: 'h2:27017', shard: 'shardA', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: { a_1: { ops: 9, since } }, storage: { a_1: { sizeBytes: 100, reusableBytes: 0, cacheBytes: 0 } }, error: null } } },
+      { host: 'h3:27017', shard: 'shardB', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: { a_1: { ops: 0, since } }, storage: { a_1: { sizeBytes: 60, reusableBytes: 0, cacheBytes: 0 } }, error: null } } },
+    ],
+    samples: [], now: new Date(),
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  const a = idx.perShard.find((s) => s.shard === 'shardA');
+  const b = idx.perShard.find((s) => s.shard === 'shardB');
+  assert.equal(a.ops, 9);
+  assert.equal(a.observedNodes, 2);
+  assert.equal(a.observedSizeBytes, 200);
+  assert.equal(b.ops, 0);
+  assert.equal(b.observedNodes, 1);
+});
+
+test('a non-sharded deployment still works with no shards argument at all', () => {
+  const merged = mergeNodes({
+    members: [{ host: 'h1:27017', reachable: true, hidden: false }],
+    nodeResults: [
+      { host: 'h1:27017', namespaces: ['shop.orders'], skipped: [],
+        collections: { 'shop.orders': { indexes: [{ name: 'a_1', key: { a: 1 } }], usage: {}, storage: {}, error: null } } },
+    ],
+    samples: [], now: new Date(),
+  });
+  const idx = merged.indexes.find((i) => i.name === 'a_1');
+  assert.deepEqual(merged.shards, []);
+  assert.equal(idx.perNode[0].shard, null);
+  assert.deepEqual(idx.definition.notHosting, []);
+  assert.deepEqual(merged.namespaces[0].shards, [null]);
+});
