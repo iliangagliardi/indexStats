@@ -1,8 +1,10 @@
 # Running indexStats.js against a sharded cluster
 
 `indexStats.js` detects a `mongos` automatically (it looks at `hello().msg === 'isdbgrid'`) and
-collects every shard, splitting index usage, storage and schema findings out per shard rather than
-merging them into one misleading bucket.
+collects every shard, splitting index usage and storage out per shard rather than merging them
+into one misleading bucket. Schema findings are not shard-attributed: they come from a single
+sample taken per namespace through the router connection, the same as the one sample taken per
+namespace on a replica set, and are not subject to the per-shard coverage reasoning in §4 below.
 
 How much of the cluster it actually sees depends on whether it can open its **own** connection
 straight to each shard's members, or only has the one connection you gave it, routed through the
@@ -40,20 +42,23 @@ mongosh "mongodb+srv://<user>@<cluster>.mongodb.net/?readPreference=secondaryPre
   --quiet --file indexStats.js
 ```
 
-This is still routed through `mongos`, but now a secondary answers when one is available, so you
-accumulate usage evidence from a second member per shard across runs. The script never overrides
-the read preference your connection string sets — whatever you pass is what gets recorded in the
-report and used to pick which member answers.
+This is still routed through `mongos`, but now a secondary answers instead of the primary when one
+is available. Each namespace's `$collStats`/`$indexStats` call is routed independently, so a single
+run can genuinely observe more than one distinct secondary per shard — the script accumulates every
+host it sees. The script never overrides the read preference your connection string sets —
+whatever you pass is what gets recorded in the report and used to pick which member answers.
 
-It still does not reach **every** member of every shard in one run. A three-member shard has a
-third member no single read preference will select. For that, see the next section.
+It still does not reach **every** member of every shard, in general. `secondaryPreferred` just
+means the primary is never selected while a secondary is available — it is not a guarantee that
+every secondary gets a turn, so a shard can still come back `partial`. For a run that is guaranteed
+to reach every member, see the next section.
 
 ---
 
 ## 3. On-prem: full coverage via `mongos` + `INDEXSTATS_URI`
 
 ```bash
-INDEXSTATS_URI='mongodb://user:pass@{host}/?directConnection=true' \
+INDEXSTATS_URI='mongodb://user:pass@{host}/?directConnection=true&appName=indexStats' \
   mongosh "mongodb://mongos-host:27017/" --quiet --file indexStats.js
 ```
 
