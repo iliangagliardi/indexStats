@@ -178,7 +178,7 @@ From a clone, with Node 20+:
 node --test
 ```
 
-Expect 149 passing, 0 failing. Note the bare form: `node --test test/` fails on Node 26, which
+Expect 252 passing, 0 failing. Note the bare form: `node --test test/` fails on Node 26, which
 rejects directory arguments.
 
 ### Against a throwaway replica set
@@ -215,6 +215,24 @@ On a cluster seeded minutes ago you should see **0 drop candidates** — every u
 younger than the 14-day threshold, so nothing is eligible. That is the safety guard working, and
 `e2e/verify.js` asserts it.
 
+### Against a throwaway sharded cluster
+
+A parallel suite, `e2e/sharded.sh {start|stop}`, brings up two two-member shards plus a config
+server and a `mongos` (ports 27019 and 27031-27034, router on 27030) the same way — plain forked
+processes, no containers, disjoint ports so it can run alongside `e2e/cluster.sh`. See
+[RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md#trying-it-safely-first) for the
+full invocation, including how to exercise both the direct and the `mongos`-routed collection
+paths.
+
+`e2e/verify.js` also accepts a few environment variables worth knowing about either suite:
+`INDEXSTATS_E2E_REPORT` overrides the report path it reads (used in place of the positional
+argument, e.g. when invoking it from `mongosh`, where `argv[2]` is the connection string rather
+than a filename); `INDEXSTATS_E2E_MODE=indirect` selects the Atlas-shaped assertions for a sharded
+run collected through `mongos` instead of directly; `INDEXSTATS_E2E_EXPECT=unreachable` asserts the
+unreachable-member downgrade instead of the all-reachable case. Precedence for the report path is
+the command-line argument, then `INDEXSTATS_E2E_REPORT`, then the `indexStats-report.html`
+default.
+
 ---
 
 ## 7. Upgrading and removing
@@ -239,5 +257,7 @@ namespace names you would rather not keep — it embeds the full report data as 
 - [RUNNING-ON-REPLICA-SETS.md](RUNNING-ON-REPLICA-SETS.md) — the connection template, which members
   get queried, how to read the verdicts, when to distrust the report, the Compass peer-payload
   workflow, Atlas caveats, the full configuration reference, and troubleshooting.
-- Sharded clusters are not supported. The script detects a `mongos` and refuses rather than
-  producing a partial report; run it against one shard's replica set at a time.
+- [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md) — connect straight to a
+  `mongos`. Covers Atlas, widening coverage with `readPreference=secondaryPreferred`, full
+  per-shard coverage via `INDEXSTATS_URI`, reading the shard coverage panel, and the one extra
+  privilege (`listShards`) a sharded cluster needs.

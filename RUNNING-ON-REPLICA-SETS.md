@@ -268,14 +268,14 @@ an honest `inconclusive` report rather than a wrong one, but it is not much use.
 
 ## 9. Sharded clusters
 
-Not supported, and refused explicitly rather than half-reported:
+Connecting to a `mongos` is supported directly — the script detects it (`hello().msg ===
+'isdbgrid'`) and collects every shard, rather than refusing or silently treating the router as a
+replica set. It is enough of a different shape, with its own coverage model, that it gets its own
+guide: [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md).
 
-```
-FATAL: connected to a mongos: sharded clusters are not supported, because rs.conf() does not
-exist there - connect to a member of one shard instead
-```
-
-Run it against one shard's replica set at a time.
+You can still point `mongosh` at a single shard's own replica set instead, if that is all you want
+to audit — everything in this document applies there unchanged, since a shard's replica set is an
+ordinary replica set.
 
 ---
 
@@ -310,7 +310,7 @@ document reads, and you still get usage, storage and redundancy analysis.
 | Report shows `N/M members` with N < M | Some member did not answer | Nothing is droppable until it does — that is the design, not a bug |
 | Everything is `inconclusive` on a healthy cluster | Counters younger than 14 days, usually after a rolling restart | Wait, or lower `DROP_MIN_COUNTER_DAYS` knowing exactly what you are giving up |
 | `URI_TEMPLATE must contain {host}` | Template has a fixed host | Replace the host with `{host}` |
-| `FATAL: connected to a mongos` | Connected to a router | Connect to a shard member |
+| Nearly every index is `inconclusive` when connected to a `mongos` | Normal on Atlas and most routed connections — only the read-preference-selected member per shard was observed | See [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md) for widening coverage |
 | `Connect to a database first: ...` | Run with no connection (e.g. `mongosh --nodb`) | Launch mongosh against a member |
 | `FATAL: indexStats.js failed unexpectedly: ...` | A genuine error inside the run | The message carries the real cause; report it with the output |
 | `sampling skipped: ...` | The connection used for sampling could not be opened at all, so no collection was sampled | Same causes as an unreachable member. Usage, storage and redundancy analysis are unaffected |
@@ -352,3 +352,17 @@ finding in a report before pointing the script at anything you care about.
 
 On a cluster seeded minutes ago you should see **0 drop candidates** — every counter is younger
 than the threshold. That is the safety guard working, and `e2e/verify.js` asserts it.
+
+A parallel suite, `e2e/sharded.sh {start|stop}`, brings up a throwaway sharded cluster the same
+way (plain forked `mongod`/`mongos` processes, disjoint ports, so it can run alongside this one) —
+see [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md#trying-it-safely-first).
+
+`e2e/verify.js` reads a few environment variables worth knowing about on either suite:
+`INDEXSTATS_E2E_REPORT` overrides the report path (used in place of the positional argument above,
+which is ignored when the script is run under `mongosh` instead of plain `node`, since there
+`argv[2]` is the connection string rather than a filename); `INDEXSTATS_E2E_MODE=indirect` selects
+the Atlas-shaped assertions for a sharded run collected through `mongos` rather than directly (only
+meaningful against `e2e/sharded.sh`); `INDEXSTATS_E2E_EXPECT=unreachable` asserts the
+unreachable-member downgrade instead of the all-reachable case. The report path is resolved in this
+order: the command-line argument, then `INDEXSTATS_E2E_REPORT`, then the `indexStats-report.html`
+default.
