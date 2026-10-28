@@ -1592,7 +1592,9 @@
       var bySearch = !q
         || i.ns.toLowerCase().indexOf(q) !== -1
         || i.name.toLowerCase().indexOf(q) !== -1;
-      return byFilter && bySearch;
+      var byShard = !state.shard || state.shard === 'all'
+        || (i.perShard || []).some(function (s) { return s.shard === state.shard; });
+      return byFilter && bySearch && byShard;
     });
     var key = state.sortKey;
     var dir = state.sortDir;
@@ -1653,7 +1655,7 @@
 
   const CLIENT_BOOTSTRAP = `
 var DATA = JSON.parse(document.getElementById('indexstats-data').textContent);
-var STATE = { filter: 'all', search: '', sortKey: 'size', sortDir: -1 };
+var STATE = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'all' };
 var FILTERS = ['all','drop','likely-drop','redundant','inconclusive','mismatched','keep',
                'suspect-field','used-only-on-hidden'];
 function h(s){return String(s).replace(/[&<>"]/g,function(c){
@@ -1664,6 +1666,13 @@ function renderControls(){
   var html = FILTERS.filter(function(f){return f==='all'||countFor(f)>0;}).map(function(f){
     return '<button class="chip '+f+(STATE.filter===f?' on':'')+'" data-f="'+f+'">'+f+' '+countFor(f)+'</button>';
   }).join('');
+  if (DATA.shards && DATA.shards.length > 1) {
+    html += '<select id="shard"><option value="all">all shards</option>' +
+      DATA.shards.map(function(s){
+        return '<option value="'+h(s.name)+'"'+(STATE.shard===s.name?' selected':'')+'>'+
+          h(s.name)+' ('+h(s.coverage)+')</option>';
+      }).join('') + '</select>';
+  }
   html += '<input type="search" id="q" placeholder="filter by namespace or index name" value="'+h(STATE.search)+'">';
   html += '<button class="act" id="copy">copy dropIndexes commands</button>';
   var el = document.getElementById('controls');
@@ -1673,6 +1682,8 @@ function renderControls(){
   });
   var q = document.getElementById('q');
   q.oninput = function(){ STATE.search = q.value; drawTable(); drawCards(); };
+  var sh = document.getElementById('shard');
+  if (sh) sh.onchange = function(){ STATE.shard = sh.value; draw(); };
   document.getElementById('copy').onclick = function(){
     var cmds = dropCommandsFor(selectIndexes(DATA.indexes, STATE));
     var btn = document.getElementById('copy');
@@ -1705,6 +1716,15 @@ function detailFor(i){
     return '<li>'+h(r)+'</li>';}).join('')+'</ul>';
   if(i.schema && i.schema.checks.length) parts += '<ul class="muted">'+i.schema.checks.map(function(c){
     return '<li>key field <span class="mono">'+h(c.field)+'</span>: '+h(c.text)+'</li>';}).join('')+'</ul>';
+  if(i.perShard && i.perShard.length > 1){
+    parts += '<table><thead><tr><th>shard</th><th class="num">ops</th>'+
+      '<th class="num">size</th><th class="num">members observed</th></tr></thead><tbody>'+
+      i.perShard.map(function(s){
+        return '<tr><td class="mono">'+h(s.shard)+'</td><td class="num">'+s.ops+
+          '</td><td class="num">'+fmtBytes(s.sizeBytes)+'</td><td class="num">'+
+          s.observedNodes+'</td></tr>';
+      }).join('')+'</tbody></table>';
+  }
   parts += '<table><thead><tr><th>member</th><th class="num">ops</th><th class="num">counter age</th>'+
     '<th class="num">size</th><th class="num">reusable</th></tr></thead><tbody>'+nodeRows(i)+'</tbody></table>';
   return parts;
@@ -1795,6 +1815,9 @@ tr.idx:hover td{background:var(--card)}
 .tag.inconclusive,.tag.redundant{background:var(--warnbg);color:var(--warn)}
 .tag.mismatched{background:var(--card);color:var(--fg)}
 .tag.keep{background:var(--accentbg);color:var(--accent)}
+.tag.full{background:var(--card);color:var(--ok)}
+.tag.partial{background:var(--warnbg);color:var(--warn)}
+.tag.none{background:var(--dangerbg);color:var(--danger)}
 .detail{background:var(--card)}
 .detail table{margin:0}
 .detail td,.detail th{border-bottom:none;padding:3px 4px}
@@ -1827,6 +1850,38 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
       + 'confirmed unused, so zero-operation verdicts are downgraded to inconclusive</div>';
   }
 
+  // The shard coverage panel. On Atlas, where direct shard connections are
+  // refused, nearly every verdict comes back inconclusive - this panel is what
+  // turns that from "the tool is broken" into "here is exactly what was
+  // observed, and here is how to widen it".
+  function renderShardCoverage(payload) {
+    const shards = payload.shards ?? [];
+    if (shards.length === 0) return '';
+    const rows = shards.map((s) => {
+      const how = s.mode === 'indirect'
+        ? `through mongos (readPreference ${esc(s.readPref)})`
+        : 'direct connection to each member';
+      const seen = s.observedHosts.length
+        ? `${s.observedHosts.length} of ${s.expectedHosts.length} members: `
+          + s.observedHosts.map((h) => esc(h)).join(', ')
+        : 'no members answered';
+      const note = s.error ? ` - ${esc(s.error)}` : s.draining ? ' - draining' : '';
+      return `<tr><td class="mono">${esc(s.name)}</td><td>${how}</td>`
+        + `<td><span class="tag ${esc(s.coverage)}">${esc(s.coverage)}</span></td>`
+        + `<td>${seen}${note}</td></tr>`;
+    }).join('');
+    const partial = shards.filter((s) => s.coverage !== 'full').length;
+    const note = partial
+      ? `<div class="muted">${partial} shard${partial > 1 ? 's were' : ' was'} not fully `
+        + 'observed, so zero-operation verdicts there are downgraded to inconclusive. '
+        + 'Connect with readPreference=secondaryPreferred, or run against each shard '
+        + 'directly, to widen coverage.</div>'
+      : '';
+    return `<details open><summary>shard coverage (${shards.length})</summary>`
+      + '<table><thead><tr><th>shard</th><th>reached</th><th>coverage</th>'
+      + `<th>members observed</th></tr></thead><tbody>${rows}</tbody></table>${note}</details>`;
+  }
+
   function renderGapsPanel(payload) {
     const total = payload.gaps.skipped.length + payload.gaps.unreachableMembers.length;
     if (total === 0) return '';
@@ -1857,6 +1912,7 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
 <div class="muted">${esc(payload.meta.generatedAt)}</div>
 </div>
 ${renderGapBanner(payload)}
+${renderShardCoverage(payload)}
 <div class="cards" id="cards"></div>
 <div class="members">${renderMembers(payload.members)}</div>
 <div class="controls" id="controls"></div>
@@ -1870,7 +1926,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, discoverShards, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

@@ -248,3 +248,77 @@ test('the redundant card count always equals the redundant chip count', () => {
   assert.equal(summarise(all).redundant, chip);
   assert.equal(chip, 3);
 });
+
+const { renderShardCoverage } = require('../indexStats.js');
+
+const SHARDED_PAYLOAD = {
+  meta: { replicaSetName: 'shopCluster', generatedAt: '2026-10-28T00:00:00Z',
+          topology: 'sharded', mode: 'multi-node', scriptVersion: '3.1.0',
+          capabilities: {}, config: {} },
+  members: [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false, role: 'primary', delaySecs: 0 }],
+  shards: [
+    { name: 'shardA', mode: 'direct', coverage: 'full', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017'], readPref: 'secondaryPreferred', draining: false, error: null },
+    { name: 'shardB', mode: 'indirect', coverage: 'partial', observedHosts: ['h3:27017'],
+      expectedHosts: ['h3:27017', 'h4:27017'], readPref: 'primary', draining: false, error: null },
+  ],
+  namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
+                 shards: ['shardA', 'shardB'], hasValidator: false, sample: null }],
+  indexes: [],
+  gaps: { unreachableMembers: [], skipped: [] },
+};
+
+test('renderShardCoverage names every shard, how it was reached, and its coverage', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
+  assert.match(html, /shardA/);
+  assert.match(html, /shardB/);
+  assert.match(html, /full/);
+  assert.match(html, /partial/);
+});
+
+test('renderShardCoverage explains a partially covered shard in terms a reader can act on', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
+  assert.match(html, /mongos/);
+  assert.match(html, /readPreference/);
+  assert.match(html, /secondaryPreferred/);
+});
+
+test('renderShardCoverage renders nothing on a deployment with no shards', () => {
+  assert.equal(renderShardCoverage({ shards: [] }), '');
+  assert.equal(renderShardCoverage({}), '');
+});
+
+test('renderShardCoverage escapes shard names', () => {
+  const html = renderShardCoverage({ shards: [{ name: '<script>x</script>', mode: 'direct',
+    coverage: 'full', observedHosts: [], expectedHosts: [], readPref: 'primary', error: null }] });
+  assert.equal(html.includes('<script>x</script>'), false);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test('the sharded report embeds the shard coverage panel', () => {
+  const html = renderHTML(SHARDED_PAYLOAD);
+  assert.match(html, /shardB/);
+});
+
+test('selectIndexes filters by shard', () => {
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardA', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+    { ns: 'shop.orders', name: 'b_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardB', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+  ];
+  const state = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'shardA' };
+  assert.deepEqual(selectIndexes(indexes, state).map((i) => i.name), ['a_1']);
+});
+
+test('selectIndexes with shard "all" or no shard key keeps every index', () => {
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardA', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+  ];
+  assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'all' }).length, 1);
+  assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1 }).length, 1);
+});
