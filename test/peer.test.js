@@ -350,7 +350,12 @@ function shardedLocalPayload() {
       maxOps: 5, minCounterAgeDays: 40, clusterSizeBytes: 1000, perMemberSizeBytes: 1000,
       perShard: [{ shard: 'shardA', ops: 5, observedSizeBytes: 1000, observedNodes: 1,
                    present: true, sizeBytes: 1000 }],
-      sizeEstimated: true,
+      // Deliberately false in the input fixture: if the recompute block were
+      // missing or dead, this stale value would survive the merge's
+      // JSON.parse(JSON.stringify(local)) clone untouched, and the assertion
+      // below would pass for the wrong reason. Only a genuine recompute flips
+      // it to true.
+      sizeEstimated: false,
       redundancy: { class: null, coveredBy: null },
       definition: { consistent: true, missingOn: [], notHosting: [],
                     variants: [{ key: { a: 1 }, hosts: ['h1:27017'] }] },
@@ -386,5 +391,5 @@ test('merged non-sharded payload has unchanged aggregates and no sizeEstimated f
   const p = mergePeerPayloads(single('h1', 0, 40, 'likely-drop'), [single('h2', 0, 40, 'likely-drop')]);
   assert.equal(p.indexes[0].clusterSizeBytes, 1000);
   assert.equal(p.indexes[0].perMemberSizeBytes, 500);
-  assert.ok(!p.indexes[0].sizeEstimated);
+  assert.equal(p.indexes[0].sizeEstimated, false);
 });

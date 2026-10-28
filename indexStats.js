@@ -832,7 +832,7 @@
     const byKey = new Map(out.indexes.map((i) => [`${i.ns} ${i.name}`, i]));
     const COVERAGE_RANK = { none: 0, partial: 1, full: 2 };
     out.shards = out.shards ?? [];
-    const shardByName = new Map(out.shards.map((s) => [s.name, s]));
+    const shardByName = new Map(out.shards.map((s) => [s.name ?? null, s]));
 
     for (const peer of peers) {
       // Shard records union by name. A peer that observed more members of a
@@ -841,11 +841,11 @@
       // silently turn a confirmed drop candidate into an estimate - or worse,
       // the reverse.
       for (const s of peer.shards ?? []) {
-        const known = shardByName.get(s.name);
+        const known = shardByName.get(s.name ?? null);
         if (!known) {
           const copy = JSON.parse(JSON.stringify(s));
           out.shards.push(copy);
-          shardByName.set(s.name, copy);
+          shardByName.set(s.name ?? null, copy);
           continue;
         }
         for (const h of s.observedHosts ?? []) {
