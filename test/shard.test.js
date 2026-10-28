@@ -220,6 +220,13 @@ test('buildShardRecord never reports full coverage when nothing was expected', (
   assert.equal(rec.coverage, 'none');
 });
 
+test('buildShardRecord never reports full coverage when the expected-host list is empty but a member answered', () => {
+  const rec = buildShardRecord(SHARD_A, {
+    mode: 'indirect', expectedHosts: [], observedHosts: ['h1:27017'],
+    readPref: 'primary', error: null, unattributed: false });
+  assert.equal(rec.coverage, 'partial');
+});
+
 test('buildShardRecord carries the implicit single shard of a non-sharded deployment', () => {
   const rec = buildShardRecord({ name: null, setName: null, hosts: [], state: 1, draining: false }, {
     mode: 'direct', expectedHosts: ['h1:27017'], observedHosts: ['h1:27017'],
