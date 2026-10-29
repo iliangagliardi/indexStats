@@ -228,8 +228,8 @@ paths.
 `INDEXSTATS_E2E_REPORT` overrides the report path it reads (used in place of the positional
 argument, e.g. when invoking it from `mongosh`, where `argv[2]` is the connection string rather
 than a filename); `INDEXSTATS_E2E_MODE=indirect` selects the Atlas-shaped assertions for a sharded
-run collected through `mongos` instead of directly; `INDEXSTATS_E2E_EXPECT=unreachable` asserts the
-unreachable-member downgrade instead of the all-reachable case. Precedence for the report path is
+run collected through `mongos` instead of directly; `INDEXSTATS_E2E_EXPECT=not-analyzed` asserts the
+not-analyzed-member downgrade instead of the everything-analyzed case. Precedence for the report path is
 the command-line argument, then `INDEXSTATS_E2E_REPORT`, then the `indexStats-report.html`
 default.
 

@@ -191,7 +191,7 @@ An index only ever becomes droppable when **all** of these hold:
 
 Any hole gives `inconclusive` instead. The three that occur in practice:
 
-- **A member was unreachable.** "Zero ops everywhere we looked" is not "zero ops everywhere".
+- **A member was not analyzed.** "Zero ops everywhere we looked" is not "zero ops everywhere".
 - **A member was reached but a collection errored** — commonly a `$collStats` `MaxTimeMSExpired`
   on a very large collection. That member observed nothing for those indexes, so it cannot vouch
   for them.
@@ -200,7 +200,7 @@ Any hole gives `inconclusive` instead. The three that occur in practice:
   restarted cluster legitimately reports nothing as droppable.
 
 The report states which of these applied, per index, in the row's drill-down — and banners
-unreachable members at the top. If you see a banner, the answer is "not yet", not "probably fine".
+not-analyzed members at the top. If you see a banner, the answer is "not yet", not "probably fine".
 
 ---
 
@@ -261,7 +261,7 @@ Atlas needs care and is not fully supported:
   enrichment; sampled documents still detect arrays.
 - Atlas hostnames are long; use the `{host}` template with `tls=true`.
 
-Test with two members before assuming a full run works. If members come back unreachable, you get
+Test with two members before assuming a full run works. If members come back not analyzed, you get
 an honest `inconclusive` report rather than a wrong one, but it is not much use.
 
 ---
@@ -303,7 +303,7 @@ document reads, and you still get usage, storage and redundancy analysis.
 
 | What you see | Cause | Fix |
 |---|---|---|
-| `member X unreachable: ...` and everything `inconclusive` | The fan-out connection to X failed | Check `URI_TEMPLATE` credentials, TLS options, and that X's `rs.conf()` address resolves from where you are running |
+| `member X not analyzed: ...` and everything `inconclusive` | The fan-out connection to X failed | Check `URI_TEMPLATE` credentials, TLS options, and that X's `rs.conf()` address resolves from where you are running |
 | `this shell CAN open connections, but the one built from URI_TEMPLATE did not work` | Template or credentials wrong | Fix `URI_TEMPLATE`, or set `INDEXSTATS_URI`, and re-run |
 | `this shell forbids opening additional connections` | Restricted shell (Compass) | Use the [peer-payload workflow](#7-restricted-shells-compass--the-peer-payload-workflow) |
 | `this shell analysed only X: the deployment is not a replica set` | Standalone `mongod` | Expected. Single-node mode; verdicts stay cautious |
@@ -313,7 +313,7 @@ document reads, and you still get usage, storage and redundancy analysis.
 | Nearly every index is `inconclusive` when connected to a `mongos` | Normal on Atlas and most routed connections — only the read-preference-selected member per shard was observed | See [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md) for widening coverage |
 | `Connect to a database first: ...` | Run with no connection (e.g. `mongosh --nodb`) | Launch mongosh against a member |
 | `FATAL: indexStats.js failed unexpectedly: ...` | A genuine error inside the run | The message carries the real cause; report it with the output |
-| `sampling skipped: ...` | The connection used for sampling could not be opened at all, so no collection was sampled | Same causes as an unreachable member. Usage, storage and redundancy analysis are unaffected |
+| `sampling skipped: ...` | The connection used for sampling could not be opened at all, so no collection was sampled | Same causes as a not-analyzed member. Usage, storage and redundancy analysis are unaffected |
 | No schema findings for some collections, but no error printed | Sampling failed for *that namespace only* (commonly `Unauthorized` on `$sample`, or `MaxTimeMSExpired`). It is recorded on the namespace, not printed | Grant read on those databases, or set `SAMPLE_SIZE = 0` to disable sampling deliberately rather than by accident |
 | Report is missing collections you expect | Per-database or per-collection error, or a privilege gap | Open the "gaps in this report" panel — every skipped namespace is listed with its reason |
 
@@ -362,7 +362,7 @@ see [RUNNING-ON-SHARDED-CLUSTERS.md](RUNNING-ON-SHARDED-CLUSTERS.md#trying-it-sa
 which is ignored when the script is run under `mongosh` instead of plain `node`, since there
 `argv[2]` is the connection string rather than a filename); `INDEXSTATS_E2E_MODE=indirect` selects
 the Atlas-shaped assertions for a sharded run collected through `mongos` rather than directly (only
-meaningful against `e2e/sharded.sh`); `INDEXSTATS_E2E_EXPECT=unreachable` asserts the
-unreachable-member downgrade instead of the all-reachable case. The report path is resolved in this
+meaningful against `e2e/sharded.sh`); `INDEXSTATS_E2E_EXPECT=not-analyzed` asserts the
+not-analyzed-member downgrade instead of the everything-analyzed case. The report path is resolved in this
 order: the command-line argument, then `INDEXSTATS_E2E_REPORT`, then the `indexStats-report.html`
 default.

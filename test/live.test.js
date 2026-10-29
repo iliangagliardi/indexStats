@@ -153,7 +153,7 @@ test('excludes hidden members when INCLUDE_HIDDEN is false', () => {
 // a gap, so a zero-ops index on the visible members looked fully confirmed
 // even though the hidden analytics member (the likeliest actual user of
 // that index) was never consulted.
-test('excluded-by-config hidden members are still reported, as a distinct non-"unreachable" reason', () => {
+test('excluded-by-config hidden members are still reported, with their own not-analyzed reason', () => {
   const { members, excludedByConfig } = discoverMembers(fakeAdmin({
     _id: 'rs0',
     members: [{ _id: 0, host: 'h1:27017' },
@@ -478,7 +478,7 @@ test('collectSharded uses mongos for every shard when no direct connection can b
   assert.equal(out.shardRecords[0].mode, 'indirect');
   assert.equal(out.shardRecords[0].coverage, 'partial');
   assert.deepEqual(out.shardRecords[0].observedHosts, ['h1:27017']);
-  // The member mongos never routed to must appear as unreachable, so the
+  // The member mongos never routed to must appear as not analyzed, so the
   // existing coverage gates can see the hole.
   const unseen = out.members.find((m) => m.host === 'h2:27017');
   assert.equal(unseen.reachable, false);
@@ -643,7 +643,7 @@ test('a directly-reached shard whose member fails is partial coverage, never ret
   assert.equal(out.shardRecords[0].mode, 'direct');
   assert.equal(out.shardRecords[0].coverage, 'partial');
   assert.deepEqual(out.shardRecords[0].observedHosts, ['h1:27017']);
-  // The unreachable member still counts towards what full coverage would mean.
+  // The not-analyzed member still counts towards what full coverage would mean.
   assert.deepEqual(out.shardRecords[0].expectedHosts, ['h1:27017', 'h2:27017']);
   // The shard as a whole did not fail - only one of its members did.
   assert.equal(out.shardRecords[0].error, null);
@@ -656,8 +656,8 @@ test('a directly-reached shard whose member fails is partial coverage, never ret
   assert.equal(up.reachable, true);
 
   assert.deepEqual(out.nodeResults.map((r) => r.host), ['h1:27017']);
-  assert.ok(printed.some((m) => /h2:27017 unreachable/.test(m)),
-    'the unreachable member must be reported to the operator');
+  assert.ok(printed.some((m) => /h2:27017 not analyzed/.test(m)),
+    'the not-analyzed member must be reported to the operator');
 });
 
 // Regression for the mislabelling fix: a standalone (non-replica-set) shard
@@ -713,7 +713,7 @@ function unauthorizedShardConn() {
   };
 }
 
-test('a direct shard that fails wholesale still reports its hosts as unreachable members', () => {
+test('a direct shard that fails wholesale still reports its hosts as not-analyzed members', () => {
   const printed = [];
   const out = collectSharded({
     conn: POISON_MONGOS, config: DIRECT_CONFIG, shards: [SHARD_B],
@@ -784,14 +784,14 @@ test('a wholly-failed direct shard holds back an otherwise-droppable index', () 
 
   // The failed shard's members reached the gap accounting at all - this is the
   // mechanism the verdict below depends on.
-  assert.deepEqual(payload.gaps.unreachableMembers.map((m) => m.host),
+  assert.deepEqual(payload.gaps.notAnalyzedMembers.map((m) => m.host),
     ['b1:27017', 'b2:27017']);
 
   const idx = payload.indexes.find((i) => i.name === 'status_1');
   assert.notEqual(idx.verdict, 'drop');
   assert.notEqual(idx.verdict, 'likely-drop');
   assert.equal(idx.verdict, 'inconclusive');
-  assert.match(idx.reasons.join(' '), /b1:27017, b2:27017 could not be reached/);
+  assert.match(idx.reasons.join(' '), /b1:27017, b2:27017 were not analyzed/);
 });
 
 // FINDING 2 (review, important): collectFromMongos' first statement is an

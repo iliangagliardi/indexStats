@@ -47,7 +47,7 @@
     }
   ],
   "gaps": {
-    "unreachableMembers": [],
+    "notAnalyzedMembers": [],
     "skipped": [
       {
         "member": "h1:27017",

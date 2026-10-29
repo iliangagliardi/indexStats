@@ -12,7 +12,7 @@ function payload(over = {}) {
       { id: 0, host: 'h1:27017', role: 'primary', hidden: false, delaySecs: 0, votes: 1, reachable: true, error: null },
       { id: 1, host: 'h2:27017', role: 'secondary', hidden: true, delaySecs: 0, votes: 1, reachable: false, error: 'HostUnreachable' },
     ],
-    gaps: { unreachableMembers: [{ host: 'h2:27017', error: 'HostUnreachable' }],
+    gaps: { notAnalyzedMembers: [{ host: 'h2:27017', error: 'HostUnreachable' }],
             skipped: [{ member: 'h1:27017', ns: 'shop.big', reason: 'MaxTimeMSExpired' }] },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
                    hasValidator: false, sample: { size: 100, member: 'h1:27017' } }],
@@ -40,7 +40,17 @@ test('renders a complete standalone document', () => {
   const html = renderHTML(payload());
   assert.match(html, /^<!DOCTYPE html>/);
   assert.match(html, /<\/html>\s*$/);
-  assert.match(html, /prefers-color-scheme/);
+  assert.match(html, /<style>/);
+});
+
+// The report is deliberately light-only. It used to carry a
+// prefers-color-scheme block, which meant a reader whose OS was in dark mode
+// got a black page - the exact thing that made this report read as "nerdy"
+// rather than as a document. Pin the decision so nobody reinstates it by
+// reflex: a dark variant is a design choice to be made deliberately, not a
+// media query to be added back because it is conventional.
+test('commits to a single light theme and never follows the OS dark preference', () => {
+  assert.equal(renderHTML(payload()).includes('prefers-color-scheme'), false);
 });
 
 test('makes no network requests of any kind', () => {
@@ -68,13 +78,14 @@ test('a payload value containing a closing script tag cannot break out', () => {
   assert.equal(jsonForScript({ a: '</script>' }).includes('</script>'), false);
 });
 
-test('shows the replica set name and member count in the header', () => {
+test('shows the deployment name and the scope line in the header', () => {
   const html = renderHTML(payload());
   assert.match(html, /rs-prod-eu/);
-  assert.match(html, /2 members/);
+  assert.match(html, /2 nodes/);
+  assert.match(html, /1 collection/);
 });
 
-test('banners the unreachable member and the verdict downgrade', () => {
+test('banners the not-analyzed member and the verdict downgrade', () => {
   const html = renderHTML(payload());
   assert.match(html, /h2:27017/);
   assert.match(html, /inconclusive/i);
@@ -83,26 +94,26 @@ test('banners the unreachable member and the verdict downgrade', () => {
 test('omits the gap banner entirely when every member answered', () => {
   const p = payload();
   p.members[1].reachable = true;
-  p.gaps.unreachableMembers = [];
+  p.gaps.notAnalyzedMembers = [];
   assert.equal(renderHTML(p).includes('id="gap-banner"'), false);
 });
 
 // Controller ruling: the brief's version of this test asserted /hidden/ against
 // the whole document, which passes merely because the word appears in the
-// embedded JSON payload - the fixture's hidden member is also unreachable, and
+// embedded JSON payload - the fixture's hidden member is also not analyzed, and
 // renderMembers must show BOTH statuses on its tile, not just one. Assert on
 // the member strip's own markup so a regression that drops the hidden status
-// (while keeping the unreachable note) would fail this test.
-test('labels a hidden member as hidden in the member strip', () => {
+// (while keeping the not-analyzed note) would fail this test.
+test('labels a hidden member as hidden in the nodes panel', () => {
   const html = renderHTML(payload());
-  const membersMatch = html.match(/<div class="members">([\s\S]*?)<\/div>\s*<div class="controls"/);
-  assert.ok(membersMatch, 'member strip present');
+  const membersMatch = html.match(/<div class="nodes">([\s\S]*?)<\/details>/);
+  assert.ok(membersMatch, 'nodes panel present');
   const strip = membersMatch[1];
-  const tileMatch = strip.match(/<div class="member down">[\s\S]*?<\/div>\s*<\/div>/);
-  assert.ok(tileMatch, 'a "member down" tile is present');
+  const tileMatch = strip.match(/<div class="node down">[\s\S]*?<\/div>\s*<\/div>/);
+  assert.ok(tileMatch, 'a "node down" tile is present');
   const tile = tileMatch[0];
   assert.match(tile, /hidden/);
-  assert.match(tile, /unreachable/);
+  assert.match(tile, /not analyzed/);
 });
 
 test('lists skipped namespaces with their reason', () => {
@@ -111,7 +122,7 @@ test('lists skipped namespaces with their reason', () => {
   assert.match(html, /MaxTimeMSExpired/);
 });
 
-const { selectIndexes, summarise, dropCommandsFor } = require('../indexStats.js');
+const { selectIndexes, summarise, dropCommandsFor, VERDICT_ORDER } = require('../indexStats.js');
 
 function ix(over) {
   return { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
@@ -224,6 +235,19 @@ test('the report embeds the client functions and boots them', () => {
   assert.match(html, /id="table-host"/);
 });
 
+// selectIndexes cannot close over the module's verdict ordering (the test
+// below pins that it closes over nothing), so it restates the order inline.
+// Two copies of one rule drift. Pin them to each other: extract the literal
+// array out of the shipped function source and compare it to the module's.
+test('the verdict order inlined into selectIndexes matches the module\'s', () => {
+  const src = selectIndexes.toString();
+  const m = src.match(/var order = \[([^\]]+)\]/);
+  assert.ok(m, 'selectIndexes still carries an inline verdict order');
+  const inlined = m[1].split(',').map((x) => x.trim().replace(/^'|'$/g, ''));
+  assert.deepEqual(inlined, VERDICT_ORDER,
+    'the inlined order drifted from VERDICT_ORDER - update both');
+});
+
 test('client functions close over nothing from the enclosing scope', () => {
   for (const fn of [selectIndexes, summarise, dropCommandsFor, fmtBytes]) {
     const src = fn.toString();
@@ -249,7 +273,7 @@ test('the redundant card count always equals the redundant chip count', () => {
   assert.equal(chip, 3);
 });
 
-const { renderShardCoverage } = require('../indexStats.js');
+const { renderShardCoverage, renderShardNote } = require('../indexStats.js');
 
 const SHARDED_PAYLOAD = {
   meta: { replicaSetName: 'shopCluster', generatedAt: '2026-10-28T00:00:00Z',
@@ -265,7 +289,7 @@ const SHARDED_PAYLOAD = {
   namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
                  shards: ['shardA', 'shardB'], hasValidator: false, sample: null }],
   indexes: [],
-  gaps: { unreachableMembers: [], skipped: [] },
+  gaps: { notAnalyzedMembers: [], skipped: [] },
 };
 
 test('renderShardCoverage names every shard, how it was reached, and its coverage', () => {
@@ -288,10 +312,27 @@ test('renderShardCoverage explains a partially covered shard in terms a reader c
   assert.match(html, /readPreference primary/);
 });
 
-test('renderShardCoverage appends the actionable advisory note when any shard is partial', () => {
-  const html = renderShardCoverage(SHARDED_PAYLOAD);
+// The advisory lives in its own renderer now: the coverage TABLE folds away
+// with the other reference material, but the sentence explaining why verdicts
+// were held back has to stay visible beside those verdicts.
+test('renderShardNote states the actionable advisory when any shard is partial', () => {
+  const html = renderShardNote(SHARDED_PAYLOAD);
   assert.match(html, /secondaryPreferred/);
-  assert.match(html, /downgraded to inconclusive/);
+  assert.match(html, /stay inconclusive rather than becoming drop candidates/);
+});
+
+test('renderShardNote stays silent when every shard was fully analyzed', () => {
+  const full = { shards: SHARDED_PAYLOAD.shards.map((s) => ({ ...s, coverage: 'full' })) };
+  assert.equal(renderShardNote(full), '');
+  assert.equal(renderShardNote({ shards: [] }), '');
+  assert.equal(renderShardNote({}), '');
+});
+
+// It must reach the page, not merely exist: a renderer nobody calls explains
+// nothing. Assert on the advisory's own prose, which the embedded JSON payload
+// cannot contain.
+test('the sharded report carries the advisory above the table', () => {
+  assert.match(renderHTML(SHARDED_PAYLOAD), /stay inconclusive rather than becoming drop candidates/);
 });
 
 test('renderShardCoverage renders nothing on a deployment with no shards', () => {

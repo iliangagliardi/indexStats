@@ -9,7 +9,7 @@ function single(host, ops, ageDays, verdict) {
     meta: { mode: 'single-node', replicaSetName: 'rs0' },
     members: [{ id: 0, host, role: 'primary', hidden: false, delaySecs: 0, votes: 1,
                 reachable: true, error: null }],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: [host],
                    hasValidator: false, sample: null }],
     indexes: [{
@@ -85,7 +85,7 @@ function realistic(host, members, ops, ageDays) {
         delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' })),
     ],
     gaps: {
-      unreachableMembers: others.map((h) => ({ host: h, error: 'connection refused' })),
+      notAnalyzedMembers: others.map((h) => ({ host: h, error: 'connection refused' })),
       skipped: [],
     },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: [host],
@@ -117,7 +117,7 @@ test('controller three-member scenario: peer evidence for known-unreachable host
   assert.equal(idx.perNode.length, 3, 'expected perNode entries for all three hosts');
   assert.equal(idx.maxOps, 9000, 'expected h3\'s 9000 ops to be counted');
   assert.equal(idx.clusterSizeBytes, 1500);
-  assert.deepEqual(merged.gaps.unreachableMembers, []);
+  assert.deepEqual(merged.gaps.notAnalyzedMembers, []);
 
   const reAnalysed = applyAnalysis(merged, CONFIG, []);
   assert.equal(reAnalysed.indexes[0].verdict, 'keep');
@@ -143,7 +143,7 @@ test('a host no payload ever covers stays unreachable and still forces inconclus
   // h3 is never covered by any payload.
 
   const merged = mergePeerPayloads(local, [peerB]);
-  assert.deepEqual(merged.gaps.unreachableMembers.map((m) => m.host), ['h3']);
+  assert.deepEqual(merged.gaps.notAnalyzedMembers.map((m) => m.host), ['h3']);
 
   const reAnalysed = applyAnalysis(merged, CONFIG, []);
   assert.equal(reAnalysed.indexes[0].verdict, 'inconclusive');
@@ -179,7 +179,7 @@ test('finding 2: a peer-merged payload with an errored member agrees with the di
       { id: 0, host: 'h1', role: 'primary', hidden: false, delaySecs: 0, votes: 1, reachable: true, error: null },
       { id: 1, host: 'h2', role: 'unknown', hidden: false, delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' },
     ],
-    gaps: { unreachableMembers: [{ host: 'h2', error: 'connection refused' }], skipped: [] },
+    gaps: { notAnalyzedMembers: [{ host: 'h2', error: 'connection refused' }], skipped: [] },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1'], hasValidator: false, sample: null }],
     indexes: [{
       ns: 'shop.orders', name: 'a_1', key: { a: 1 }, options: {}, hidden: false,
@@ -202,7 +202,7 @@ test('finding 2: a peer-merged payload with an errored member agrees with the di
       { id: 0, host: 'h1', role: 'unknown', hidden: false, delaySecs: 0, votes: 1, reachable: false, error: 'connection refused' },
     ],
     gaps: {
-      unreachableMembers: [{ host: 'h1', error: 'connection refused' }],
+      notAnalyzedMembers: [{ host: 'h1', error: 'connection refused' }],
       skipped: [{ member: 'h2', ns: 'shop.orders', reason: 'MaxTimeMSExpired' }],
     },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h2'], hasValidator: false, sample: null }],
@@ -268,7 +268,7 @@ const SHARD_LOCAL = { name: 'shardA', setName: 'shardA', hosts: ['h1:27017', 'h2
 
 function payloadWithShards(shards, members) {
   return { members, shards, namespaces: [], indexes: [],
-           gaps: { unreachableMembers: [], skipped: [] },
+           gaps: { notAnalyzedMembers: [], skipped: [] },
            meta: { mode: 'single-node' } };
 }
 
@@ -316,10 +316,10 @@ test('merging the same sharded peer twice is a no-op', () => {
 
 test('mergePeerPayloads still works on payloads with no shards at all', () => {
   const local = { members: [{ host: 'h1:27017', reachable: true, hidden: false }],
-    namespaces: [], indexes: [], gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [], indexes: [], gaps: { notAnalyzedMembers: [], skipped: [] },
     meta: { mode: 'single-node' } };
   const peer = { members: [{ host: 'h2:27017', reachable: true, hidden: false }],
-    namespaces: [], indexes: [], gaps: { unreachableMembers: [], skipped: [] },
+    namespaces: [], indexes: [], gaps: { notAnalyzedMembers: [], skipped: [] },
     meta: { mode: 'single-node' } };
   const out = mergePeerPayloads(local, [peer]);
   assert.deepEqual(out.shards ?? [], []);
@@ -340,7 +340,7 @@ function shardedLocalPayload() {
       state: 1, draining: false, mode: 'direct', coverage: 'partial',
       expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017'],
       readPref: 'secondaryPreferred', error: null }],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
       shards: ['shardA'], hasValidator: false, sample: null }],
     indexes: [{
@@ -372,7 +372,7 @@ function noOpShardedPeer() {
       state: 1, draining: false, mode: 'direct', coverage: 'partial',
       expectedHosts: ['h1:27017', 'h2:27017'], observedHosts: ['h1:27017'],
       readPref: 'secondaryPreferred', error: null }],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [],
     indexes: [],
   };
@@ -423,7 +423,7 @@ function notHostingLocalPayload() {
         mode: 'direct', coverage: 'full', expectedHosts: ['h3:27017'],
         observedHosts: ['h3:27017'], ambiguousHosts: [], readPref: 'primary', error: null },
     ],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [{ ns: 'shop.lookup', db: 'shop', coll: 'lookup', presentOn: ['h1:27017'],
       shards: ['shardA'], hasValidator: false, sample: null }],
     indexes: [{
@@ -450,7 +450,7 @@ function emptyPeer() {
     meta: { mode: 'single-node' },
     members: [],
     shards: [],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [],
     indexes: [],
   };
