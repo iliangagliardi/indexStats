@@ -106,7 +106,7 @@ index no member of a shard reported on is `inconclusive` even where the shard as
 by one member and its siblings were never asked about that particular namespace.
 
 **Any shard short of `full` downgrades zero-usage verdicts to `inconclusive` for every namespace it
-hosts**, the same way an unreachable replica-set member does on a plain replica set. This is a
+hosts**, the same way a not-analyzed replica-set member does on a plain replica set. This is a
 per-namespace gate, not a whole-report one: a namespace that lives only on fully-covered shards can
 still get a real `drop` recommendation even while another shard elsewhere in the same cluster is
 `partial`.
@@ -185,7 +185,7 @@ INDEXSTATS_E2E_MODE=indirect node e2e/verify.js indexStats-report.html
 
 `e2e/verify.js` also honours `INDEXSTATS_E2E_REPORT` (the report path, used instead of the
 positional argument — handy when invoking it from mongosh, where `argv[2]` is the connection string
-rather than a filename) and `INDEXSTATS_E2E_EXPECT=unreachable` (asserts the unreachable-member
+rather than a filename) and `INDEXSTATS_E2E_EXPECT=not-analyzed` (asserts the not-analyzed-member
 downgrade instead of the all-reachable case). Precedence is: the command-line argument, then
 `INDEXSTATS_E2E_REPORT`, then the `indexStats-report.html` default.
 

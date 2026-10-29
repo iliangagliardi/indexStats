@@ -51,11 +51,11 @@
  *   - read-only: never mutates data, never drops anything - all output is advisory
  *   - views and system collections excluded up front
  *   - only a shard whose every data-bearing member was observed ('full'
- *     coverage) can carry a droppable verdict, exactly as an unreachable
+ *     coverage) can carry a droppable verdict, exactly as a not-analyzed
  *     member blocks one on a replica set
  *   - per-database, per-collection, per-member, per-shard and
- *     per-namespace-sample error isolation (one bad namespace, unreachable
- *     member or unreachable shard never kills the run)
+ *     per-namespace-sample error isolation (one bad namespace, a not-analyzed
+ *     member or not-analyzed shard never kills the run)
  *   - maxTimeMS on every server call so a stalled node cannot hang the report,
  *     with one documented exception: mongosh's getCollectionInfos()/getIndexes()
  *     helpers accept no maxTimeMS parameter
@@ -384,12 +384,12 @@
       .map(toMember);
     // FINDING 4 (final review, important): when INCLUDE_HIDDEN is false, the
     // hidden members filtered out above used to vanish from the accounting
-    // entirely - they never appear in gaps.unreachableMembers either, so a
+    // entirely - they never appear in gaps.notAnalyzedMembers either, so a
     // zero-ops index goes straight to drop/likely-drop while the hidden
     // analytics member (the likeliest actual user of that index) was never
     // consulted, and nothing in the report says so. Surface them as a
-    // distinct, config-caused gap - shaped exactly like an unreachable member
-    // so the existing ctx.unreachableHosts safety gate in deriveVerdict
+    // distinct, config-caused gap - shaped exactly like a not-analyzed member
+    // so the existing ctx.notAnalyzedHosts safety gate in deriveVerdict
     // downgrades affected verdicts, and renderMembers/renderGapsPanel show
     // the hole - but keep them OUT of `members` (main()'s connection
     // targets), since INCLUDE_HIDDEN=false means "never contact these", not
@@ -399,7 +399,7 @@
       .map((m) => ({
         ...toMember(m),
         reachable: false,
-        error: 'excluded by INCLUDE_HIDDEN=false configuration - never contacted, not unreachable',
+        error: 'not analyzed - excluded by INCLUDE_HIDDEN=false configuration, so this member was never contacted',
       }));
     return { replicaSetName: rsConfig._id, mode: 'multi-node', members, excludedByConfig };
   }
@@ -705,7 +705,7 @@
           } catch (e) {
             member.reachable = false;
             member.error = e.codeName ?? e.message;
-            printFn(`shard ${shard.name} member ${member.host} unreachable: ${member.error}`);
+            printFn(`shard ${shard.name} member ${member.host} not analyzed: ${member.error}`);
           }
         }
         for (const excluded of discovered.excludedByConfig ?? []) {
@@ -720,13 +720,13 @@
         // as Unauthorized, which is realistic whenever the shard credentials in
         // URI_TEMPLATE differ from the mongos session - would otherwise
         // contribute NO member entries at all. Nothing then reaches
-        // gaps.unreachableMembers, so ctx.unreachableHosts stays empty and that
+        // gaps.notAnalyzedMembers, so ctx.notAnalyzedHosts stays empty and that
         // gate is silent; and the shard's coverage:'none' record gates nothing
         // either, because nsShards is built only from shards that actually
         // reported a namespace, so a shard that reported nothing appears in no
         // namespace's list. A zero-operation index could then still be
         // recommended for drop while the member that might be using it was
-        // never consulted - the unreachable-member downgrade this project
+        // never consulted - the not-analyzed-member downgrade this project
         // treats as load-bearing, silently skipped. Synthesise the same shape
         // the indirect branch below already builds, so the gates can see the
         // hole. (Deliberately NOT a fallback to the mongos: a directly-reached
@@ -833,7 +833,7 @@
         }));
         // Every configured member of an indirect shard becomes a member entry:
         // the ones mongos routed to are reachable, the rest are explicitly
-        // unreachable. That is what lets the existing coverage gates see the
+        // not analyzed. That is what lets the existing coverage gates see the
         // hole instead of silently assuming the shard was fully observed.
         for (const host of shard.hosts) {
           members.push({
@@ -1252,7 +1252,7 @@
       members,
       shards: shardList,
       gaps: {
-        unreachableMembers: members.filter((m) => !m.reachable)
+        notAnalyzedMembers: members.filter((m) => !m.reachable)
           .map((m) => ({ host: m.host, error: m.error })),
         skipped,
       },
@@ -1281,10 +1281,10 @@
   //
   // Acceptance gate: `discoverMembers` reads replSetGetConfig on the LOCAL
   // connection alone, so even a single-node run already lists every replica-
-  // set member, marking every one but the seed as an unreachable placeholder.
+  // set member, marking every one but the seed as a not-analyzed placeholder.
   // A peer's evidence for host H must therefore be accepted whenever the
   // local payload has no PRESENT/covered entry for H yet - whether H is
-  // absent from `members` entirely, or present only as that unreachable
+  // absent from `members` entirely, or present only as that not-analyzed
   // placeholder - not only when H is a genuinely brand-new host. A host is
   // "covered" once some payload (local or an earlier peer in this same call)
   // supplied a genuine reachable member entry for it; re-merging the same
@@ -1337,18 +1337,18 @@
         if (!accepted.has(m.host)) continue;
         const i = out.members.findIndex((om) => om.host === m.host);
         if (i === -1) out.members.push(m);
-        else out.members[i] = m; // replace the unreachable placeholder with genuine data
+        else out.members[i] = m; // replace the not-analyzed placeholder with genuine data
         coveredHosts.add(m.host);
       }
 
-      // Reconcile gaps: a host we just covered can no longer be "unreachable",
+      // Reconcile gaps: a host we just covered can no longer be "not analyzed",
       // and any host neither local nor any peer has covered must stay so.
-      out.gaps.unreachableMembers = out.gaps.unreachableMembers
+      out.gaps.notAnalyzedMembers = out.gaps.notAnalyzedMembers
         .filter((u) => !accepted.has(u.host));
-      for (const m of peer.gaps.unreachableMembers) {
+      for (const m of peer.gaps.notAnalyzedMembers) {
         if (coveredHosts.has(m.host)) continue; // covered by local or an earlier/this peer
-        if (!out.gaps.unreachableMembers.some((u) => u.host === m.host)) {
-          out.gaps.unreachableMembers.push(m);
+        if (!out.gaps.notAnalyzedMembers.some((u) => u.host === m.host)) {
+          out.gaps.notAnalyzedMembers.push(m);
         }
       }
 
@@ -1379,7 +1379,7 @@
         // A genuine observation always beats a placeholder: drop any existing
         // entry for a host we're about to add real data for (there shouldn't
         // be one, since mergeNodes never emits perNode placeholders for
-        // unreachable members - but this keeps the "at most one entry per
+        // not-analyzed members - but this keeps the "at most one entry per
         // (index, host)" invariant explicit rather than assumed).
         target.perNode = target.perNode.filter((n) => !accepted.has(n.host));
         target.perNode.push(...nodes);
@@ -1844,7 +1844,7 @@
       // to whichever member happens to sort first in rs.config, not to the member the
       // script is actually running on. Running this exact degraded path directly on a
       // secondary (127.0.0.1:27022) produced a payload claiming host 127.0.0.1:27021 -
-      // a different, potentially genuinely-unreachable member - was the one reachable.
+      // a different, potentially genuinely-not-analyzed member - was the one reachable.
       // Fixed by extracting the selection into the pure, tested selectCollectionTargets.
       const targets = selectCollectionTargets(discovered.members, config.SEED_HOST, fanOut);
 
@@ -1859,7 +1859,7 @@
         } catch (e) {
           member.reachable = false;
           member.error = e.codeName ?? e.message;
-          print(`member ${member.host} unreachable: ${member.error}`);
+          print(`member ${member.host} not analyzed: ${member.error}`);
         }
         if (!fanOut) break;
       }
@@ -2032,7 +2032,7 @@
     // observation for THIS index (a collection-level error, a per-database
     // skip, or - in a merged peer payload - a namespace that peer's own run
     // never reached at all) must block a droppable verdict exactly like an
-    // unreachable member does. Before this gate, `idx.definition.missingOn`
+    // not-analyzed member does. Before this gate, `idx.definition.missingOn`
     // deliberately excludes these hosts (that field means "confirmed genuinely
     // absent", not "unknown"), so `definition.consistent` stayed true and a
     // zero-ops verdict sailed straight through to likely-drop/drop while
@@ -2088,8 +2088,10 @@
       return { verdict: 'inconclusive', flags, reasons };
     }
 
-    if (ctx.unreachableHosts.length) {
-      reasons.unshift(`zero operations everywhere observed, but ${ctx.unreachableHosts.join(', ')} could not be reached - unused cannot be confirmed`);
+    if (ctx.notAnalyzedHosts.length) {
+      const notAnalyzedLabel = ctx.notAnalyzedHosts.length > 1 ? 'were' : 'was';
+      reasons.unshift(`zero operations everywhere observed, but ${ctx.notAnalyzedHosts.join(', ')} `
+        + `${notAnalyzedLabel} not analyzed - unused cannot be confirmed`);
       return { verdict: 'inconclusive', flags, reasons };
     }
     if (idx.minCounterAgeDays === null
@@ -2110,7 +2112,7 @@
 
   function applyAnalysis(payload, config, samples) {
     const hiddenHosts = payload.members.filter((m) => m.hidden).map((m) => m.host);
-    const unreachableHosts = payload.gaps.unreachableMembers.map((m) => m.host);
+    const notAnalyzedHosts = payload.gaps.notAnalyzedMembers.map((m) => m.host);
     const reachableHosts = payload.members.filter((m) => m.reachable).map((m) => m.host);
     const nsShards = {};
     for (const n of payload.namespaces ?? []) nsShards[n.ns] = n.shards ?? null;
@@ -2125,7 +2127,7 @@
                 validator: sample.validator }, config)
           : [],
       };
-      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, unreachableHosts,
+      Object.assign(idx, deriveVerdict(idx, { config, hiddenHosts, notAnalyzedHosts,
         reachableHosts, shards: payload.shards ?? [], nsShards }));
     }
 
@@ -2143,6 +2145,17 @@
 
   function jsonForScript(obj) {
     return JSON.stringify(obj).replace(/</g, '\\u003c');
+  }
+
+  // Pure: the masthead wants a date a person reads, not a full ISO timestamp.
+  // Falls back to the raw string rather than inventing one if it cannot parse -
+  // a wrong date in a report header is worse than an ugly one.
+  function dateOf(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso ?? '');
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${d.getUTCDate()} ${months[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
   }
 
   function fmtBytes(bytes) {
@@ -2171,11 +2184,22 @@
     });
     var key = state.sortKey;
     var dir = state.sortDir;
+    // Inlined deliberately. This function is stringified into the report and
+    // runs there with no enclosing scope, so the severity ordering cannot be
+    // shared with the module-level copy - it has to be restated here. Keep the
+    // two in step; a test pins that this function references nothing outside
+    // itself, which is why the shared name is not even mentioned.
+    var order = ['drop', 'likely-drop', 'redundant', 'inconclusive', 'mismatched', 'keep'];
     return rows.slice().sort(function (a, b) {
       var av, bv;
       if (key === 'ops') { av = a.maxOps; bv = b.maxOps; }
       else if (key === 'age') { av = a.minCounterAgeDays || 0; bv = b.minCounterAgeDays || 0; }
       else if (key === 'ns') { return dir * (a.ns + a.name).localeCompare(b.ns + b.name); }
+      else if (key === 'verdict') {
+        var ai = order.indexOf(a.verdict), bi = order.indexOf(b.verdict);
+        if (ai !== bi) return dir * (bi - ai);
+        return b.clusterSizeBytes - a.clusterSizeBytes;
+      }
       else { av = a.clusterSizeBytes; bv = b.clusterSizeBytes; }
       return dir * (av - bv);
     });
@@ -2228,7 +2252,7 @@
 
   const CLIENT_BOOTSTRAP = `
 var DATA = JSON.parse(document.getElementById('indexstats-data').textContent);
-var STATE = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'all' };
+var STATE = { filter: 'all', search: '', sortKey: 'verdict', sortDir: -1, shard: 'all' };
 var FILTERS = ['all','drop','likely-drop','redundant','inconclusive','mismatched','keep',
                'suspect-field','used-only-on-hidden'];
 function h(s){return String(s).replace(/[&<>"]/g,function(c){
@@ -2242,8 +2266,10 @@ function countFor(f){return selectIndexes(DATA.indexes,
   {filter:f,search:'',sortKey:'size',sortDir:-1,shard:STATE.shard}).length;}
 function renderControls(){
   var html = FILTERS.filter(function(f){return f==='all'||countFor(f)>0;}).map(function(f){
-    return '<button class="chip '+f+(STATE.filter===f?' on':'')+'" data-f="'+f+'">'+f+' '+countFor(f)+'</button>';
+    return '<button class="chip '+f+(STATE.filter===f?' on':'')+'" data-f="'+f+'">'+f+
+      '<span class="c">'+countFor(f)+'</span></button>';
   }).join('');
+  html = '<div class="chips">'+html+'</div><div class="actions">';
   if (DATA.shards && DATA.shards.length > 1) {
     html += '<select id="shard"><option value="all">all shards</option>' +
       DATA.shards.map(function(s){
@@ -2251,15 +2277,16 @@ function renderControls(){
           h(s.name)+' ('+h(s.coverage)+')</option>';
       }).join('') + '</select>';
   }
-  html += '<input type="search" id="q" placeholder="filter by namespace or index name" value="'+h(STATE.search)+'">';
-  html += '<button class="act" id="copy">copy dropIndexes commands</button>';
+  html += '<input type="search" id="q" placeholder="namespace or index name" value="'+h(STATE.search)+'">';
+  html += '<button class="act" id="copy">copy drop commands</button>';
+  html += '</div>';
   var el = document.getElementById('controls');
   el.innerHTML = html;
   el.querySelectorAll('.chip').forEach(function(b){
     b.onclick = function(){ STATE.filter = b.dataset.f; draw(); };
   });
   var q = document.getElementById('q');
-  q.oninput = function(){ STATE.search = q.value; drawTable(); drawCards(); };
+  q.oninput = function(){ STATE.search = q.value; drawTable(); drawLede(); };
   var sh = document.getElementById('shard');
   if (sh) sh.onchange = function(){ STATE.shard = sh.value; draw(); };
   document.getElementById('copy').onclick = function(){
@@ -2271,13 +2298,26 @@ function renderControls(){
     }, function(){ btn.textContent = 'clipboard blocked - see raw payload'; });
   };
 }
-function drawCards(){
-  var s = summarise(selectIndexes(DATA.indexes, STATE));
-  document.getElementById('cards').innerHTML =
-    '<div class="card"><div class="k">reclaimable, cluster</div><div class="v">'+fmtBytes(s.reclaimable)+'</div></div>'+
-    '<div class="card"><div class="k">drop candidates</div><div class="v">'+s.drop+'</div></div>'+
-    '<div class="card"><div class="k">inconclusive</div><div class="v">'+s.inconclusive+'</div></div>'+
-    '<div class="card"><div class="k">redundant</div><div class="v">'+s.redundant+'</div></div>';
+/* One sentence replaces the old four-tile stat row. A reader should be able to
+   stop after this line and know whether there is anything to do. The counts
+   respect every active filter, so it always describes the rows actually shown. */
+function drawLede(){
+  var sel = selectIndexes(DATA.indexes, STATE);
+  var s = summarise(sel);
+  var txt;
+  if (s.drop > 0) {
+    txt = '<span class="n crit">'+s.drop+'</span> drop candidate'+(s.drop===1?'':'s')+
+      ', freeing <strong>'+fmtBytes(s.reclaimable)+'</strong> across the cluster.';
+  } else if (sel.length === 0) {
+    txt = 'No indexes match this filter.';
+  } else {
+    txt = 'No drop candidates: nothing here can be shown to be unused.';
+  }
+  var rest = [];
+  if (s.inconclusive) rest.push(s.inconclusive+' inconclusive');
+  if (s.redundant) rest.push(s.redundant+' redundant');
+  if (rest.length) txt += ' <span class="muted">'+rest.join(' \u00b7 ')+'</span>';
+  document.getElementById('lede').innerHTML = txt;
 }
 function nodeRows(i){
   return i.perNode.map(function(n){
@@ -2290,11 +2330,11 @@ function nodeRows(i){
   }).join('');
 }
 function detailFor(i){
-  var parts = '<div class="muted">'+h(JSON.stringify(i.key))+
-    (i.redundancy.coveredBy?' - covered by '+h(i.redundancy.coveredBy):'')+'</div>';
-  if(i.reasons && i.reasons.length) parts += '<ul class="muted">'+i.reasons.map(function(r){
+  var parts = '<div class="key mono">'+h(JSON.stringify(i.key))+
+    (i.redundancy.coveredBy?' <span class="muted">covered by '+h(i.redundancy.coveredBy)+'</span>':'')+'</div>';
+  if(i.reasons && i.reasons.length) parts += '<ul>'+i.reasons.map(function(r){
     return '<li>'+h(r)+'</li>';}).join('')+'</ul>';
-  if(i.schema && i.schema.checks.length) parts += '<ul class="muted">'+i.schema.checks.map(function(c){
+  if(i.schema && i.schema.checks.length) parts += '<ul>'+i.schema.checks.map(function(c){
     return '<li>key field <span class="mono">'+h(c.field)+'</span>: '+h(c.text)+'</li>';}).join('')+'</ul>';
   if(i.perShard && i.perShard.length > 1){
     parts += '<table><thead><tr><th>shard</th><th class="num">ops</th>'+
@@ -2311,18 +2351,21 @@ function detailFor(i){
 }
 function drawTable(){
   var rows = selectIndexes(DATA.indexes, STATE);
-  var head = '<table><thead><tr><th data-s="ns">namespace and index</th><th>verdict</th>'+
-    '<th class="num" data-s="ops">ops, max</th><th class="num" data-s="age">counter age</th>'+
-    '<th class="num" data-s="size">cluster size</th></tr></thead><tbody>';
+  function sortMark(k){ return STATE.sortKey===k ? '<span class="sm">'+(STATE.sortDir<0?'\u25be':'\u25b4')+'</span>' : ''; }
+  var head = '<table><thead><tr><th data-s="ns">index'+sortMark('ns')+'</th>'+
+    '<th data-s="verdict">verdict'+sortMark('verdict')+'</th>'+
+    '<th class="num" data-s="ops">ops'+sortMark('ops')+'</th>'+
+    '<th class="num" data-s="age">counter age'+sortMark('age')+'</th>'+
+    '<th class="num" data-s="size">size'+sortMark('size')+'</th></tr></thead><tbody>';
   var body = rows.map(function(i,n){
-    return '<tr class="idx" data-n="'+n+'"><td><span class="mono">'+h(i.ns)+
-      '</span><div class="mono muted">'+h(i.name)+'</div></td>'+
+    return '<tr class="idx" data-n="'+n+'"><td><div class="ns mono">'+h(i.ns)+
+      '</div><div class="ixname mono">'+h(i.name)+'</div></td>'+
       '<td><span class="tag '+i.verdict+'">'+i.verdict+'</span>'+
-      (i.flags.length?'<div class="muted">'+h(i.flags.join(', '))+'</div>':'')+'</td>'+
+      (i.flags.length?'<div class="flags">'+h(i.flags.join(', '))+'</div>':'')+'</td>'+
       '<td class="num">'+i.maxOps+'</td>'+
       '<td class="num">'+(i.minCounterAgeDays===null?'-':i.minCounterAgeDays.toFixed(0)+' d')+'</td>'+
       '<td class="num">'+fmtBytes(i.clusterSizeBytes)+
-      (i.sizeEstimated?'<div class="muted">estimated</div>':'')+'</td></tr>'+
+      (i.sizeEstimated?'<div class="flags">estimated</div>':'')+'</td></tr>'+
       '<tr class="detail" id="d'+n+'" hidden><td colspan="5">'+detailFor(i)+'</td></tr>';
   }).join('');
   document.getElementById('table-host').innerHTML = head + body + '</tbody></table>';
@@ -2341,69 +2384,122 @@ function drawTable(){
     };
   });
 }
-function draw(){ renderControls(); drawCards(); drawTable(); }
+function draw(){ renderControls(); drawLede(); drawTable(); }
 document.getElementById('raw').textContent = JSON.stringify(DATA, null, 2);
 draw();
 `;
 
   const REPORT_CSS = `
-:root{--bg:#fff;--card:#f7f7f5;--fg:#1a1a19;--muted:#6b6b68;--line:#e3e3e0;
---danger:#b3261e;--dangerbg:#fdecea;--warn:#8a5300;--warnbg:#fdf3e3;
---accent:#1a56a8;--accentbg:#eaf1fb;--ok:#1e6b3a}
-@media(prefers-color-scheme:dark){:root{--bg:#191918;--card:#232322;--fg:#ececeb;
---muted:#a1a19d;--line:#33332f;--danger:#f2857c;--dangerbg:#3a1f1c;--warn:#e0ac5c;
---warnbg:#332715;--accent:#8fb6f0;--accentbg:#1b2740;--ok:#7fc79b}}
+/* MongoDB-aligned palette. Light only, deliberately: a report that flips to a
+   dark surface on the reader's OS preference read as "black and nerdy" to the
+   person this is written for. Every ink below clears 4.5:1 on both surfaces
+   (computed, not eyeballed). Verdicts are always spelled out in words - colour
+   only ever reinforces a label, it never carries meaning alone. */
+:root{
+--ink:#001E2B;--ink-2:#3D4F58;--muted:#5C6C75;
+--page:#FFFFFF;--sunken:#F9FBFA;--line:#E8EDEB;--line-2:#C1C7C6;
+--brand:#00684A;--brand-bright:#00ED64;
+--crit:#970606;--crit-soft:#FFEAE5;
+--warn:#944F01;--warn-soft:#FEF7DB;
+--info:#083C90;--info-soft:#E1F7FF;
+--good:#00684A;--good-soft:#E3FCF7}
 *{box-sizing:border-box}
-body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
-font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-h1{font-size:20px;font-weight:500;margin:0}
+body{margin:0;padding:40px 24px 64px;background:var(--page);color:var(--ink);
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .muted{color:var(--muted)}
-.wrap{max-width:1200px;margin:0 auto}
-.head{display:flex;justify-content:space-between;align-items:baseline;
-border-bottom:1px solid var(--line);padding-bottom:12px}
-.banner{margin-top:12px;padding:10px 12px;border-radius:8px;
-background:var(--warnbg);color:var(--warn);border:1px solid var(--warn)}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:16px}
-.card{background:var(--card);border-radius:8px;padding:12px 14px}
-.card .k{font-size:12px;color:var(--muted)}
-.card .v{font-size:24px;font-weight:500;margin-top:2px}
-.members{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:12px}
-.member{background:var(--card);border-left:3px solid var(--muted);padding:8px 10px;font-size:13px}
-.member.pri{border-left-color:var(--ok)}
-.member.sec{border-left-color:var(--accent)}
-.member.hid{border-left-color:var(--warn)}
-.member.down{border-left-color:var(--danger);color:var(--danger)}
-.controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:20px}
-.chip{font-size:13px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;
-background:none;color:var(--muted);cursor:pointer}
-.chip.on{border-color:var(--fg);color:var(--fg)}
-.chip.drop.on{border-color:var(--danger);color:var(--danger);background:var(--dangerbg)}
-input[type=search]{padding:6px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--bg);color:var(--fg);min-width:220px}
-button.act{padding:6px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--bg);color:var(--fg);cursor:pointer}
-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
-th{text-align:left;font-weight:400;color:var(--muted);border-bottom:1px solid var(--line);
-padding:6px 4px;cursor:pointer;white-space:nowrap}
-td{padding:8px 4px;border-bottom:1px solid var(--line);vertical-align:top}
+
+/* Masthead: name, scope, date. A 3px brand rule is the only ornament. */
+.head{border-left:3px solid var(--brand-bright);padding-left:14px;margin-bottom:28px}
+h1{font-size:22px;font-weight:600;margin:0;letter-spacing:-0.01em}
+.head .scope{font-size:13px;color:var(--muted);margin-top:3px}
+
+/* The headline: the one sentence a reader must not miss. */
+.lede{font-size:17px;line-height:1.5;margin:0 0 6px}
+.lede strong{font-weight:600}
+.lede .n{color:var(--brand);font-weight:600}
+.lede .n.crit{color:var(--crit)}
+.note{font-size:13px;color:var(--muted);margin:0 0 28px;max-width:70ch}
+/* Shown when a node contributed nothing. It explains why verdicts are being
+   held back, so it must not be mistaken for decoration - but it is an
+   explanation, not an alarm, so it stays a rule and a line of text. */
+.banner{font-size:13px;line-height:1.5;color:var(--ink-2);background:var(--warn-soft);
+border-left:3px solid var(--warn);border-radius:0 4px 4px 0;
+padding:10px 14px;margin:0 0 20px;max-width:none}
+.note a{color:var(--brand);text-decoration:underline;text-underline-offset:2px}
+
+/* Controls sit on one quiet row above the table. */
+.controls{padding-bottom:14px;border-bottom:1px solid var(--line)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.sm{margin-left:5px;color:var(--brand);font-size:10px}
+.chip{font:13px/1 inherit;border:1px solid var(--line-2);border-radius:999px;
+padding:6px 12px;background:var(--page);color:var(--ink-2);cursor:pointer}
+.chip:hover{border-color:var(--muted)}
+.chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.chip .c{opacity:.6;margin-left:4px;font-variant-numeric:tabular-nums}
+input[type=search],select{font:13px/1 inherit;padding:7px 10px;border:1px solid var(--line-2);
+border-radius:6px;background:var(--page);color:var(--ink)}
+input[type=search]{min-width:200px}
+input[type=search]:focus,select:focus{outline:2px solid var(--brand);outline-offset:-1px}
+button.act{font:13px/1 inherit;padding:7px 12px;border:1px solid var(--brand);border-radius:6px;
+background:var(--brand);color:#fff;cursor:pointer}
+button.act:hover{background:#004f38}
+
+/* The table is the page. Hairlines only - no boxes, no zebra. */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:500;font-size:12px;letter-spacing:.04em;
+text-transform:uppercase;color:var(--muted);padding:14px 8px 8px;
+border-bottom:1px solid var(--line);cursor:pointer;white-space:nowrap}
+th:hover{color:var(--ink)}
+td{padding:12px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 tr.idx{cursor:pointer}
-tr.idx:hover td{background:var(--card)}
-.tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px}
-.tag.drop,.tag.likely-drop{background:var(--dangerbg);color:var(--danger)}
-.tag.inconclusive,.tag.redundant{background:var(--warnbg);color:var(--warn)}
-.tag.mismatched{background:var(--card);color:var(--fg)}
-.tag.keep{background:var(--accentbg);color:var(--accent)}
-.tag.full{background:var(--card);color:var(--ok)}
-.tag.partial{background:var(--warnbg);color:var(--warn)}
-.tag.none{background:var(--dangerbg);color:var(--danger)}
-.detail{background:var(--card)}
-.detail table{margin:0}
-.detail td,.detail th{border-bottom:none;padding:3px 4px}
-details{margin-top:24px}
-summary{cursor:pointer;color:var(--muted)}
-pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-size:12px}
+tr.idx:hover td{background:var(--sunken)}
+.ns{font-size:13px}
+.ixname{font-size:13px;color:var(--muted);margin-top:2px}
+
+/* Verdicts: the word carries the meaning, the colour only reinforces it. */
+.tag{display:inline-block;border-radius:4px;padding:2px 8px;font-size:12px;font-weight:500;
+white-space:nowrap}
+.tag.drop,.tag.likely-drop,.tag.none{background:var(--crit-soft);color:var(--crit)}
+.tag.inconclusive,.tag.redundant,.tag.partial{background:var(--warn-soft);color:var(--warn)}
+.tag.mismatched{background:var(--info-soft);color:var(--info)}
+.tag.keep,.tag.full{background:var(--good-soft);color:var(--good)}
+.flags{font-size:12px;color:var(--muted);margin-top:4px}
+
+/* Expanded detail sits on the sunken surface so it reads as subordinate. */
+.detail>td{background:var(--sunken);padding:16px 8px 18px}
+.detail .key{font-size:13px;margin-bottom:8px}
+.detail ul{margin:0 0 10px;padding-left:18px;font-size:13px;color:var(--ink-2)}
+.detail li{margin:2px 0}
+.detail table{margin-top:10px;font-size:13px}
+.detail th{padding:0 8px 4px;border-bottom:1px solid var(--line);text-transform:none;
+letter-spacing:0;font-size:11px;cursor:default}
+.detail td{padding:4px 8px;border-bottom:none}
+
+/* Everything secondary folds away. */
+details{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+details+details{margin-top:0}
+summary{cursor:pointer;font-size:13px;color:var(--muted);list-style:none;
+display:flex;align-items:center;gap:6px}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"+";font-family:ui-monospace,monospace;color:var(--line-2)}
+details[open]>summary::before{content:"\\2013"}
+summary:hover{color:var(--ink)}
+.panel{padding:12px 0 4px}
+.nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.node{border-left:2px solid var(--line-2);padding:4px 0 4px 10px;font-size:13px}
+.node.pri{border-left-color:var(--brand)}
+.node.sec{border-left-color:var(--brand-bright)}
+.node.hid{border-left-color:var(--warn)}
+.node.down{border-left-color:var(--crit)}
+.node .why{color:var(--muted);font-size:12px;margin-top:1px}
+pre{overflow:auto;background:var(--sunken);border:1px solid var(--line);padding:14px;
+border-radius:6px;font-size:12px;max-height:420px}
+@media(max-width:640px){body{padding:24px 16px 48px}.controls{gap:6px}}
 `;
 
   function renderMembers(members) {
@@ -2414,19 +2510,19 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
       if (m.hidden) bits.push('hidden');
       if (m.delaySecs) bits.push(`delayed ${m.delaySecs}s`);
       const label = !m.reachable
-        ? `unreachable - ${esc(m.error ?? 'unknown error')}${m.hidden ? ' / hidden' : ''}${m.delaySecs ? ` / delayed ${m.delaySecs}s` : ''}`
+        ? `not analyzed - ${esc(m.error ?? 'unknown reason')}${m.hidden ? ' / hidden' : ''}${m.delaySecs ? ` / delayed ${m.delaySecs}s` : ''}`
         : bits.join(' / ');
-      return `<div class="member ${cls}"><div class="mono">${esc(m.host)}</div>`
-        + `<div class="muted">${label}</div></div>`;
+      return `<div class="node ${cls}"><div class="mono">${esc(m.host)}</div>`
+        + `<div class="why">${label}</div></div>`;
     }).join('');
   }
 
   function renderGapBanner(payload) {
-    const down = payload.gaps.unreachableMembers;
+    const down = payload.gaps.notAnalyzedMembers;
     if (down.length === 0) return '';
     const hosts = down.map((d) => esc(d.host)).join(', ');
     return `<div class="banner" id="gap-banner">${down.length} member`
-      + `${down.length > 1 ? 's' : ''} unreachable (${hosts}) - no index can be `
+      + `${down.length > 1 ? 's' : ''} not analyzed (${hosts}) - no index can be `
       + 'confirmed unused, so zero-operation verdicts are downgraded to inconclusive</div>';
   }
 
@@ -2466,32 +2562,40 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
         + `<td><span class="tag ${esc(s.coverage)}">${esc(s.coverage)}</span></td>`
         + `<td>${seen}${amb}${note}</td></tr>`;
     }).join('');
+    return `<details><summary>shard coverage (${shards.length})</summary>`
+      + '<div class="panel"><table><thead><tr><th>shard</th><th>reached</th><th>coverage</th>'
+      + `<th>members observed</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  }
+
+  // The coverage TABLE folds away with the other reference material, but when a
+  // shard is short of full coverage the REASON stays visible next to the
+  // verdicts it explains. On Atlas that is the normal case, and a report full of
+  // `inconclusive` with no standing explanation reads as a broken tool rather
+  // than an honest one.
+  function renderShardNote(payload) {
+    const shards = payload.shards ?? [];
     const partial = shards.filter((s) => s.coverage !== 'full').length;
-    const note = partial
-      ? `<div class="muted">${partial} shard${partial > 1 ? 's were' : ' was'} not fully `
-        + 'observed, so zero-operation verdicts there are downgraded to inconclusive. '
-        + 'Connect with readPreference=secondaryPreferred, or run against each shard '
-        + 'directly, to widen coverage.</div>'
-      : '';
-    return `<details open><summary>shard coverage (${shards.length})</summary>`
-      + '<table><thead><tr><th>shard</th><th>reached</th><th>coverage</th>'
-      + `<th>members observed</th></tr></thead><tbody>${rows}</tbody></table>${note}</details>`;
+    if (!partial) return '';
+    return `<p class="note">${partial} shard${partial > 1 ? 's were' : ' was'} not fully `
+      + 'analyzed, so zero-operation verdicts there stay inconclusive rather than '
+      + 'becoming drop candidates. Connect with readPreference=secondaryPreferred, or '
+      + 'run against each shard directly, to widen coverage.</p>';
   }
 
   function renderGapsPanel(payload) {
-    const total = payload.gaps.skipped.length + payload.gaps.unreachableMembers.length;
+    const total = payload.gaps.skipped.length + payload.gaps.notAnalyzedMembers.length;
     if (total === 0) return '';
     const rows = [
-      ...payload.gaps.unreachableMembers.map((m) =>
-        `<tr><td class="mono">${esc(m.host)}</td><td>member unreachable</td>`
+      ...payload.gaps.notAnalyzedMembers.map((m) =>
+        `<tr><td class="mono">${esc(m.host)}</td><td>member not analyzed</td>`
         + `<td>${esc(m.error ?? '')}</td></tr>`),
       ...payload.gaps.skipped.map((s) =>
         `<tr><td class="mono">${esc(s.member)}</td><td class="mono">${esc(s.ns)}</td>`
         + `<td>${esc(s.reason)}</td></tr>`),
     ].join('');
     return `<details><summary>gaps in this report (${total})</summary>`
-      + '<table><thead><tr><th>member</th><th>namespace</th><th>reason</th></tr></thead>'
-      + `<tbody>${rows}</tbody></table></details>`;
+      + '<div class="panel"><table><thead><tr><th>member</th><th>namespace</th>'
+      + `<th>reason</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
   }
 
   function renderHTML(payload) {
@@ -2503,18 +2607,18 @@ pre{overflow:auto;background:var(--card);padding:12px;border-radius:8px;font-siz
 <style>${REPORT_CSS}</style></head>
 <body><div class="wrap">
 <div class="head">
-<div><h1>${esc(payload.meta.replicaSetName)}</h1>
-<div class="muted mono">${payload.members.length} members / ${dbCount} databases / ${payload.namespaces.length} collections / ${payload.indexes.length} indexes</div></div>
-<div class="muted">${esc(payload.meta.generatedAt)}</div>
+<h1>${esc(payload.meta.replicaSetName)}</h1>
+<div class="scope">${payload.indexes.length} indexes &middot; ${payload.namespaces.length} collections &middot; ${dbCount} database${dbCount === 1 ? '' : 's'} &middot; ${payload.members.length} node${payload.members.length === 1 ? '' : 's'} &middot; ${esc(dateOf(payload.meta.generatedAt))}</div>
 </div>
+<p class="lede" id="lede"></p>
 ${renderGapBanner(payload)}
-${renderShardCoverage(payload)}
-<div class="cards" id="cards"></div>
-<div class="members">${renderMembers(payload.members)}</div>
+${renderShardNote(payload)}
 <div class="controls" id="controls"></div>
 <div id="table-host"></div>
+${renderShardCoverage(payload)}
+<details><summary>nodes (${payload.members.length})</summary><div class="panel"><div class="nodes">${renderMembers(payload.members)}</div></div></details>
 ${renderGapsPanel(payload)}
-<details><summary>raw payload (json)</summary><pre id="raw"></pre></details>
+<details><summary>raw payload (json)</summary><div class="panel"><pre id="raw"></pre></div></details>
 </div>
 <script type="application/json" id="indexstats-data">${jsonForScript(payload)}</script>
 <script>${CLIENT_FUNCTIONS}
@@ -2522,7 +2626,7 @@ ${CLIENT_BOOTSTRAP}</script>
 </body></html>`;
   }
 
-  const api = { SCRIPT_VERSION, detectTopology, parseShardHost, canonicalObservedHost, reconcileShardHosts, probeUriFor, PROBE_SELECTION_TIMEOUT_MS, canProbeShardsDirectly, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
+  const api = { SCRIPT_VERSION, dateOf, detectTopology, parseShardHost, canonicalObservedHost, reconcileShardHosts, probeUriFor, PROBE_SELECTION_TIMEOUT_MS, canProbeShardsDirectly, discoverShards, selectShardMode, collectSharded, isPlain, canonicalKeyString, generatedName, isStrictPrefix, classifyRedundancy, mergeNodes, buildShardRecord, demuxShardStats, mergePeerPayloads, parsePeerPayloads, selectCollectionTargets, LOW_PRESENCE, bsonTypeOf, flattenPaths, profileSample, keyFieldsOf, validatorPaths, classifySchemaIssues, VERDICT_ORDER, deriveVerdict, applyAnalysis, esc, jsonForScript, fmtBytes, renderHTML, renderShardCoverage, renderShardNote, selectIndexes, summarise, dropCommandsFor, probeCapabilities, uriFor, discoverMembers, deriveSeedHost, collectFromNode, collectFromMongos, pickSampleMember, sampleNamespace, emit, URI_TEMPLATE, OUT_FILE, EXCLUDED_DBS, MAX_TIME_MS, INCLUDE_HIDDEN, DROP_MIN_COUNTER_DAYS, SAMPLE_SIZE, PEER_PAYLOADS };
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;

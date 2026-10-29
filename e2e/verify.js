@@ -29,7 +29,12 @@ const argPath = (typeof argv[2] === 'string' && argv[2].length > 0
   && !/^mongodb(\+srv)?:\/\//.test(argv[2]) && !argv[2].startsWith('-'))
   ? argv[2] : null;
 const file = argPath ?? env.INDEXSTATS_E2E_REPORT ?? 'indexStats-report.html';
-const expectUnreachable = env.INDEXSTATS_E2E_EXPECT === 'unreachable'
+// Accepts the old `unreachable` spellings too: the vocabulary changed to
+// "not analyzed", but a shell history or a CI job still carrying the old value
+// should keep working rather than silently asserting the wrong case.
+const expectNotAnalyzed = env.INDEXSTATS_E2E_EXPECT === 'not-analyzed'
+  || env.INDEXSTATS_E2E_EXPECT === 'unreachable'
+  || argv.includes('--expect-not-analyzed')
   || argv.includes('--expect-unreachable');
 const shardMode = env.INDEXSTATS_E2E_MODE === 'indirect' ? 'indirect' : 'direct';
 const html = fs.readFileSync(file, 'utf8');
@@ -51,9 +56,9 @@ if (!sharded) {
   assert.equal(p.members.filter((x) => x.hidden).length, 1, 'hidden member reported as hidden');
   assert.equal(p.shards.length, 0, 'a replica set has no shard records');
 
-  if (!expectUnreachable) {
+  if (!expectNotAnalyzed) {
     assert.equal(p.members.every((x) => x.reachable), true, 'every member reachable');
-    assert.equal(p.gaps.unreachableMembers.length, 0);
+    assert.equal(p.gaps.notAnalyzedMembers.length, 0);
     assert.equal(find('shop.orders', '_id_').perNode.filter((n) => n.present).length, 3,
       'the _id_ index is observed on all three members');
   }
@@ -113,7 +118,7 @@ if (!sharded) {
         `${s.name} observed exactly the members it was expected to`);
     }
     assert.equal(p.members.every((x) => x.reachable), true, 'every shard member reachable');
-    assert.equal(p.gaps.unreachableMembers.length, 0);
+    assert.equal(p.gaps.notAnalyzedMembers.length, 0);
     assert.equal(p.indexes.every((i) => i.sizeEstimated === false), true,
       'full coverage needs no size extrapolation');
 
@@ -200,8 +205,8 @@ for (const i of p.indexes) {
 assert.ok(p.indexes.some((i) => i.verdict === 'inconclusive'),
   'young counters produce inconclusive verdicts, never drop recommendations');
 
-if (expectUnreachable) {
-  assert.equal(p.gaps.unreachableMembers.length, 1, 'the stopped member is reported unreachable');
+if (expectNotAnalyzed) {
+  assert.equal(p.gaps.notAnalyzedMembers.length, 1, 'the stopped member is reported unreachable');
   assert.match(html, /unreachable/);
 }
 const where = sharded ? `sharded (${shardMode}), ${p.shards.length} shards` : 'replica set';

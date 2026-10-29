@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { deriveVerdict, applyAnalysis } = require('../indexStats.js');
 
 const CONFIG = { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 };
-const CTX = { config: CONFIG, hiddenHosts: [], unreachableHosts: [] };
+const CTX = { config: CONFIG, hiddenHosts: [], notAnalyzedHosts: [] };
 
 function idx(over = {}) {
   return {
@@ -38,7 +38,7 @@ test('a counter exactly at the threshold still permits a recommendation', () => 
 });
 
 test('an unreachable member downgrades every unused index to inconclusive', () => {
-  const ctx = { ...CTX, unreachableHosts: ['h3'] };
+  const ctx = { ...CTX, notAnalyzedHosts: ['h3'] };
   const v = deriveVerdict(idx({ redundancy: { class: 'prefix', coveredBy: 'x' } }), ctx);
   assert.equal(v.verdict, 'inconclusive');
   assert.match(v.reasons.join(' '), /h3/);
@@ -121,7 +121,7 @@ test('low-presence alone is not a suspect field', () => {
 // unreachable member does - even though `definition.missingOn` deliberately
 // excludes it (that field means "confirmed genuinely absent", not "unknown").
 test('a reachable member with a collection-level error blocks a drop even though missingOn excludes it', () => {
-  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], notAnalyzedHosts: [] };
   const v = deriveVerdict(idx({
     perNode: [
       { host: 'h1', present: true, ops: 0 },
@@ -140,7 +140,7 @@ test('a reachable member with a collection-level error blocks a drop even though
 // Same defect, reached via a per-database skip (Unauthorized) rather than a
 // per-collection error: the member never even produced a perNode entry.
 test('a reachable member entirely missing from perNode (never observed) blocks a drop', () => {
-  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], notAnalyzedHosts: [] };
   const v = deriveVerdict(idx({
     perNode: [{ host: 'h1', present: true, ops: 0 }],
     definition: { consistent: true, missingOn: [], variants: [] },
@@ -153,7 +153,7 @@ test('a reachable member entirely missing from perNode (never observed) blocks a
 // missingOn) must still take the mismatched path, not be swept into the new
 // coverage gate.
 test('a confirmed-missing member (in definition.missingOn) is still mismatched, not inconclusive-by-coverage', () => {
-  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], unreachableHosts: [] };
+  const ctx = { ...CTX, reachableHosts: ['h1', 'h2'], notAnalyzedHosts: [] };
   const v = deriveVerdict(idx({
     perNode: [{ host: 'h1', present: true, ops: 0 }],
     definition: { consistent: false, missingOn: ['h2'], variants: [] },
@@ -164,7 +164,7 @@ test('a confirmed-missing member (in definition.missingOn) is still mismatched, 
 test('applyAnalysis ranks drop candidates first, then by cluster size', () => {
   const payload = {
     members: [{ host: 'h1', hidden: false, reachable: true }],
-    gaps: { unreachableMembers: [], skipped: [] },
+    gaps: { notAnalyzedMembers: [], skipped: [] },
     namespaces: [{ ns: 'shop.orders' }],
     indexes: [
       idx({ name: 'small_drop', clusterSizeBytes: 10, redundancy: { class: 'prefix', coveredBy: 'x' } }),
@@ -194,7 +194,7 @@ function droppableIndex(overrides) {
 
 const BASE_CTX = {
   config: { DROP_MIN_COUNTER_DAYS: 14 },
-  hiddenHosts: [], unreachableHosts: [], reachableHosts: ['h1:27017'],
+  hiddenHosts: [], notAnalyzedHosts: [], reachableHosts: ['h1:27017'],
   shards: [{ name: 'shardA', coverage: 'full', mode: 'direct', observedHosts: ['h1:27017'],
              expectedHosts: ['h1:27017'], readPref: 'secondaryPreferred' }],
   nsShards: { 'shop.orders': ['shardA'] },

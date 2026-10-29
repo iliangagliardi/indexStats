@@ -38,12 +38,12 @@ function runWithGlobals(globals) {
 test('finding 3: a genuine error deep inside main() prints a FATAL line, never the "connect to a database" message', () => {
   const prints = [];
   const fakePrint = (msg) => {
-    // The per-member "unreachable" notice (main(), ~line 866) is the deepest
+    // The per-member "not analyzed" notice (main(), ~line 866) is the deepest
     // point NOT already guarded by its own outer try/catch that reports a
     // clean message - make it explode, simulating an unanticipated bug deep
     // in a spot the author reasonably assumed could only ever hit the
     // adjacent `member.reachable = false` catch cleanly.
-    if (String(msg).startsWith('member ') && String(msg).includes('unreachable')) {
+    if (String(msg).startsWith('member ') && String(msg).includes('not analyzed')) {
       throw new TypeError('simulated unexpected failure deep inside main()');
     }
     prints.push(msg);
@@ -69,7 +69,7 @@ test('finding 3: a genuine error deep inside main() prints a FATAL line, never t
     },
     getMongo() {
       // Reached by connFor() in non-fanout mode; throwing here is what the
-      // fakePrint('member ... unreachable') branch above turns into an
+      // fakePrint('member ... not analyzed') branch above turns into an
       // uncaught TypeError, since main()'s own catch block's print() call
       // is what actually explodes.
       throw new Error('connection refused');

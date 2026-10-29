@@ -68,7 +68,7 @@ test('definition is inconsistent when key patterns differ under one name', () =>
 test('unreachable members are recorded as gaps and contribute no nodes', () => {
   const withDown = [members[0], { ...members[1], reachable: false, error: 'HostUnreachable' }];
   const p = mergeNodes({ members: withDown, nodeResults: [node('h1')], samples: [], now: NOW });
-  assert.deepEqual(p.gaps.unreachableMembers, [{ host: 'h2', error: 'HostUnreachable' }]);
+  assert.deepEqual(p.gaps.notAnalyzedMembers, [{ host: 'h2', error: 'HostUnreachable' }]);
   assert.equal(p.indexes[0].perNode.length, 1);
 });
 
@@ -125,9 +125,9 @@ test('end-to-end: a collection-level error on one member downgrades an old, zero
 // FINDING 4 (final review, important): a member excluded by
 // INCLUDE_HIDDEN=false (main() folds discoverMembers().excludedByConfig into
 // the `members` list handed to mergeNodes) must show up in
-// gaps.unreachableMembers and downgrade a zero-ops verdict to inconclusive,
+// gaps.notAnalyzedMembers and downgrade a zero-ops verdict to inconclusive,
 // exactly like a genuinely unreachable member does.
-test('end-to-end: a member excluded by INCLUDE_HIDDEN=false lands in gaps.unreachableMembers and downgrades an old, zero-ops index to inconclusive', () => {
+test('end-to-end: a member excluded by INCLUDE_HIDDEN=false lands in gaps.notAnalyzedMembers and downgrades an old, zero-ops index to inconclusive', () => {
   const membersWithExcluded = [
     ...members,
     { id: 2, host: 'h3', role: 'unknown', hidden: true, delaySecs: 0, votes: 0,
@@ -139,8 +139,8 @@ test('end-to-end: a member excluded by INCLUDE_HIDDEN=false lands in gaps.unreac
     nodeResults: [node('h1', oldZeroOps), node('h2', oldZeroOps)],
     samples: [], now: NOW,
   });
-  assert.deepEqual(merged.gaps.unreachableMembers.map((m) => m.host), ['h3']);
-  assert.match(merged.gaps.unreachableMembers[0].error, /INCLUDE_HIDDEN/);
+  assert.deepEqual(merged.gaps.notAnalyzedMembers.map((m) => m.host), ['h3']);
+  assert.match(merged.gaps.notAnalyzedMembers[0].error, /INCLUDE_HIDDEN/);
 
   const payload = applyAnalysis(merged, { DROP_MIN_COUNTER_DAYS: 14, LOW_PRESENCE: 0.10 }, []);
   assert.equal(payload.indexes[0].verdict, 'inconclusive');
