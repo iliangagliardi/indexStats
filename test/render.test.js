@@ -248,3 +248,201 @@ test('the redundant card count always equals the redundant chip count', () => {
   assert.equal(summarise(all).redundant, chip);
   assert.equal(chip, 3);
 });
+
+const { renderShardCoverage } = require('../indexStats.js');
+
+const SHARDED_PAYLOAD = {
+  meta: { replicaSetName: 'shopCluster', generatedAt: '2026-10-28T00:00:00Z',
+          topology: 'sharded', mode: 'multi-node', scriptVersion: '3.1.0',
+          capabilities: {}, config: {} },
+  members: [{ host: 'h1:27017', shard: 'shardA', reachable: true, hidden: false, role: 'primary', delaySecs: 0 }],
+  shards: [
+    { name: 'shardA', mode: 'direct', coverage: 'full', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017'], readPref: 'secondaryPreferred', draining: false, error: null },
+    { name: 'shardB', mode: 'indirect', coverage: 'partial', observedHosts: ['h3:27017'],
+      expectedHosts: ['h3:27017', 'h4:27017'], readPref: 'primary', draining: false, error: null },
+  ],
+  namespaces: [{ ns: 'shop.orders', db: 'shop', coll: 'orders', presentOn: ['h1:27017'],
+                 shards: ['shardA', 'shardB'], hasValidator: false, sample: null }],
+  indexes: [],
+  gaps: { unreachableMembers: [], skipped: [] },
+};
+
+test('renderShardCoverage names every shard, how it was reached, and its coverage', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
+  assert.match(html, /shardA/);
+  assert.match(html, /shardB/);
+  assert.match(html, /full/);
+  assert.match(html, /partial/);
+});
+
+test('renderShardCoverage explains a partially covered shard in terms a reader can act on', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
+  // shardB is the indirect (mongos-routed) shard with readPref 'primary' -
+  // only the mode === 'indirect' branch can render this exact phrase, so it
+  // proves the per-shard readPref is actually rendered, not just mentioned
+  // via the static advisory note (which is what the bare /secondaryPreferred/
+  // match used to let through, since shardA's 'secondaryPreferred' is never
+  // printed for a direct shard).
+  assert.match(html, /mongos/);
+  assert.match(html, /readPreference primary/);
+});
+
+test('renderShardCoverage appends the actionable advisory note when any shard is partial', () => {
+  const html = renderShardCoverage(SHARDED_PAYLOAD);
+  assert.match(html, /secondaryPreferred/);
+  assert.match(html, /downgraded to inconclusive/);
+});
+
+test('renderShardCoverage renders nothing on a deployment with no shards', () => {
+  assert.equal(renderShardCoverage({ shards: [] }), '');
+  assert.equal(renderShardCoverage({}), '');
+});
+
+test('renderShardCoverage escapes shard names', () => {
+  const html = renderShardCoverage({ shards: [{ name: '<script>x</script>', mode: 'direct',
+    coverage: 'full', observedHosts: [], expectedHosts: [], readPref: 'primary', error: null }] });
+  assert.equal(html.includes('<script>x</script>'), false);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test('the sharded report embeds the shard coverage panel', () => {
+  const html = renderHTML(SHARDED_PAYLOAD);
+  // Assert on markup only renderShardCoverage's panel emits, not on text
+  // that also appears in the verbatim JSON payload dump embedded elsewhere
+  // in the document (e.g. "shardB"), which would pass even if the
+  // ${renderShardCoverage(payload)} call were deleted from renderHTML.
+  assert.match(html, /shard coverage \(2\)/);
+  assert.match(html, /<th>coverage<\/th>/);
+});
+
+test('selectIndexes filters by shard', () => {
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardA', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+    { ns: 'shop.orders', name: 'b_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardB', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+  ];
+  const state = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'shardA' };
+  assert.deepEqual(selectIndexes(indexes, state).map((i) => i.name), ['a_1']);
+});
+
+test('selectIndexes with shard "all" or no shard key keeps every index', () => {
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'keep', flags: [], maxOps: 0,
+      minCounterAgeDays: 1, clusterSizeBytes: 10,
+      perShard: [{ shard: 'shardA', ops: 0, sizeBytes: 10, observedNodes: 1, present: true }] },
+  ];
+  assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'all' }).length, 1);
+  assert.equal(selectIndexes(indexes, { filter: 'all', search: '', sortKey: 'size', sortDir: -1 }).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 5 (final whole-branch review, minor but user-visible): countFor built
+// its state with no `shard` key, so the filter chips always counted
+// cluster-wide while the cards and the table respected STATE.shard - select one
+// shard and a chip read "drop 7" beside a card reading "drop candidates 3".
+//
+// countFor only exists inside CLIENT_BOOTSTRAP, as text. Lift the real source
+// out of the rendered page and run it, rather than asserting on a substring:
+// that way the test exercises exactly what ships in the browser.
+
+const { esc } = require('../indexStats.js');
+
+function clientCountFor(state) {
+  const html = renderHTML(payload());
+  const src = html.match(/function countFor\(f\)\{[\s\S]*?\.length;\}/);
+  assert.ok(src, 'countFor must be present in the rendered page');
+  // ES5 only - this is stringified into a page with no transpiler.
+  assert.equal(/=>|`/.test(src[0]), false, 'countFor must stay ES5-compatible');
+  const DATA = {
+    indexes: [
+      { ns: 'shop.orders', name: 'a_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardA' }] },
+      { ns: 'shop.orders', name: 'b_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardB' }] },
+      { ns: 'shop.orders', name: 'c_1', verdict: 'keep', flags: [], clusterSizeBytes: 1,
+        perShard: [{ shard: 'shardB' }] },
+    ],
+  };
+  // eslint-disable-next-line no-new-func
+  return new Function('DATA', 'STATE', 'selectIndexes',
+    `${src[0]} return countFor;`)(DATA, state, selectIndexes);
+}
+
+test('the filter chips count within the selected shard', () => {
+  const countFor = clientCountFor({ shard: 'shardB' });
+  assert.equal(countFor('drop'), 1, 'only shardB has one drop candidate');
+  assert.equal(countFor('keep'), 1);
+  assert.equal(countFor('all'), 2);
+});
+
+test('the filter chips count cluster-wide when no shard is selected', () => {
+  const countFor = clientCountFor({ shard: 'all' });
+  assert.equal(countFor('drop'), 2);
+  assert.equal(countFor('all'), 3);
+});
+
+test('the chip count and the drop-candidates card agree for the selected shard', () => {
+  // The two numbers a reader sees side by side. They must come from the same
+  // selection, which is the whole point of threading STATE.shard through.
+  const state = { filter: 'all', search: '', sortKey: 'size', sortDir: -1, shard: 'shardB' };
+  const indexes = [
+    { ns: 'shop.orders', name: 'a_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+      perShard: [{ shard: 'shardA' }] },
+    { ns: 'shop.orders', name: 'b_1', verdict: 'drop', flags: [], clusterSizeBytes: 1,
+      perShard: [{ shard: 'shardB' }] },
+  ];
+  const card = summarise(selectIndexes(indexes, state)).drop;
+  const chip = selectIndexes(indexes, { ...state, filter: 'drop' }).length;
+  assert.equal(card, chip);
+  assert.equal(card, 1);
+});
+
+// ---------------------------------------------------------------------------
+// FINDING 1 fallout: "index not present" and "never asked" are different facts.
+// On an indirect shard, mongos sends each namespace to one member, so a
+// member's siblings legitimately have no observation for that namespace - and
+// the per-member table must not report that as the index being absent.
+
+test('a member that was never asked about a namespace is not reported as missing the index', () => {
+  const html = renderHTML(payload());
+  const src = html.match(/function nodeRows\(i\)\{[\s\S]*?\n\}/);
+  assert.ok(src, 'nodeRows must be present in the rendered page');
+  assert.equal(/=>|`/.test(src[0]), false, 'nodeRows must stay ES5-compatible');
+  const nodeRows = new Function('h', 'fmtBytes', `${src[0]} return nodeRows;`)(esc, fmtBytes);
+
+  const rows = nodeRows({ perNode: [
+    { host: 'h1:27017', present: false, observed: true, error: null },
+    { host: 'h2:27017', present: false, observed: false, error: null },
+    { host: 'h3:27017', present: false, error: null }, // an older peer payload
+  ] });
+  assert.match(rows, /h1:27017<\/td><td colspan="4" class="muted">index not present/);
+  assert.match(rows, /h2:27017<\/td><td colspan="4" class="muted">not observed on this member/);
+  assert.match(rows, /h3:27017<\/td><td colspan="4" class="muted">index not present/);
+});
+
+// ---------------------------------------------------------------------------
+// The shard coverage panel has to say when a shard's evidence could not be
+// credited to one member, because such a host is deliberately NOT counted as
+// observed - leaving it unmentioned would make the row look like a plain
+// partial.
+
+test('the shard coverage panel names hosts whose evidence could not be attributed', () => {
+  const html = renderShardCoverage({ shards: [
+    { name: 'shardA', mode: 'indirect', coverage: 'partial', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017', 'h2:27017'], ambiguousHosts: ['h2:27017'],
+      readPref: 'nearest', error: null, draining: false },
+  ] });
+  assert.match(html, /evidence from h2:27017 could not be attributed to one member/);
+});
+
+test('the shard coverage panel is unchanged for a record with no ambiguous hosts', () => {
+  const html = renderShardCoverage({ shards: [
+    { name: 'shardA', mode: 'direct', coverage: 'full', observedHosts: ['h1:27017'],
+      expectedHosts: ['h1:27017'], readPref: 'primary', error: null, draining: false },
+  ] });
+  assert.equal(html.includes('could not be attributed'), false);
+});

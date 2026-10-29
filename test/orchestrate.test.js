@@ -225,3 +225,44 @@ test('deriveSeedHost returns a synthetic, flagged literal only as a last resort'
   assert.equal(r.synthetic, true);
   assert.equal(typeof r.host, 'string');
 });
+
+const { selectShardMode, detectTopology } = require('../indexStats.js');
+
+test('selectShardMode uses direct collection when a shard member is reachable', () => {
+  assert.equal(selectShardMode({ ok: true, error: null }), 'direct');
+});
+
+test('selectShardMode falls back to mongos when the shard refuses a direct connection', () => {
+  assert.equal(selectShardMode({ ok: false, error: 'connection refused' }), 'indirect');
+});
+
+test('selectShardMode falls back to mongos when connections cannot be opened at all', () => {
+  assert.equal(selectShardMode({ ok: false, error: 'no Mongo' }), 'indirect');
+});
+
+// main() now routes on detectTopology instead of letting discoverMembers refuse
+// a mongos, so the classification it routes on is asserted here too.
+test('detectTopology classifies the mongos main() routes on as sharded', () => {
+  assert.equal(detectTopology({ msg: 'isdbgrid' }), 'sharded');
+});
+
+test('sampleNamespace labels its evidence with the host it was given, including "mongos"', () => {
+  const conn = {
+    getDB() {
+      return {
+        getCollectionInfos() { return [{ name: 'orders', options: {} }]; },
+        getCollection() {
+          return { aggregate(pipeline) {
+            const stage = Object.keys(pipeline[0])[0];
+            if (stage === '$sample') return { toArray() { return [{ _id: 1, a: 2 }]; } };
+            throw new Error('$listCatalog unavailable on mongos');
+          } };
+        },
+      };
+    },
+  };
+  const out = sampleNamespace(conn, 'shop.orders', { SAMPLE_SIZE: 10, MAX_TIME_MS: 30000 }, 'mongos');
+  assert.equal(out.member, 'mongos');
+  assert.equal(out.size, 1);
+  assert.equal(out.error, null);
+});
